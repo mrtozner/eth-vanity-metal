@@ -4,32 +4,36 @@
 [![Rust](https://img.shields.io/badge/rust-1.70%2B-orange.svg)](https://www.rust-lang.org)
 [![Platform](https://img.shields.io/badge/platform-macOS-blue.svg)](https://www.apple.com/macos/)
 [![Apple Silicon](https://img.shields.io/badge/Apple%20Silicon-M1%2FM2%2FM3%2FM4-green.svg)](https://www.apple.com/mac/)
+[![Status](https://img.shields.io/badge/status-Work%20In%20Progress-orange.svg)]()
 
 **A Metal GPU-accelerated Ethereum vanity address generator for Apple Silicon.**
 
-Generate custom Ethereum addresses with specific prefixes or suffixes at blazing speeds using Apple Silicon's native Metal GPU acceleration.
+Generate custom Ethereum addresses with specific prefixes or suffixes using Apple Silicon's native Metal GPU acceleration.
+
+> **Work In Progress**: Currently optimizing to match/exceed profanity2's OpenCL performance. See [Roadmap](#roadmap) below.
 
 ## Performance
 
 | Mode | Speed | Hardware |
 |------|-------|----------|
-| **Metal GPU** | **367 MH/s** | Apple M4 Pro |
+| **Metal GPU** | **~45 MH/s** | Apple M4 Pro |
 | CPU multi-threaded | ~2 MH/s | 14-core M4 Pro |
+| profanity2 (OpenCL) | ~100 MH/s | Apple M4 Pro |
 
-**~85% faster than profanity2** (199 MH/s) and **180x faster than CPU-only generators** on Apple Silicon!
+Current Metal implementation uses Jacobian coordinates (~16 field multiplications per iteration). Working on implementing profanity2's optimized deltaX/lambda algorithm with batch inversion (~2 multiplications per iteration) to reach 100+ MH/s.
 
-### Difficulty Estimates (at 367 MH/s)
+### Difficulty Estimates (at 45 MH/s)
 
 | Pattern Length | Combinations | Approximate Time |
 |----------------|--------------|------------------|
 | 1 character | 16 | Instant |
 | 2 characters | 256 | Instant |
 | 3 characters | 4,096 | < 1 second |
-| 4 characters | 65,536 | < 1 second |
-| 5 characters | 1,048,576 | ~3 seconds |
-| 6 characters | 16,777,216 | ~46 seconds |
-| 7 characters | 268,435,456 | ~12 minutes |
-| 8 characters | 4,294,967,296 | ~3.2 hours |
+| 4 characters | 65,536 | ~1 second |
+| 5 characters | 1,048,576 | ~23 seconds |
+| 6 characters | 16,777,216 | ~6 minutes |
+| 7 characters | 268,435,456 | ~1.6 hours |
+| 8 characters | 4,294,967,296 | ~26 hours |
 
 ## Features
 
@@ -117,15 +121,19 @@ WARNING: Keep your private key secure! Anyone with this key can access your fund
 5. Check if address matches hex pattern
 6. Return matching private key
 
-### GPU Optimizations
+### GPU Optimizations (Current)
 
 - **Precomputation Table** - 8,160 precomputed EC points for fast scalar multiplication
 - **64-bit Limbs** - Optimized uint256 arithmetic using 4x64-bit limbs
-- **Montgomery Batch Inversion** - Reduces modular inversions by 32x
-- **Jacobian Coordinates** - Avoids expensive inversions during point addition
-- **Optimized Keccak-256** - Unrolled permutation for Metal shaders
+- **Jacobian Coordinates** - Avoids per-operation inversions (~16 field muls per point addition)
+- **Optimized Keccak-256** - Unrolled 24-round permutation for Metal shaders
 - **131K GPU Threads** - Parallel processing with 2048 steps each
 - **Fast Modular Reduction** - Exploits secp256k1 prime structure: 2^256 ≡ 2^32 + 977 (mod P)
+
+### Planned Optimizations
+
+- **Montgomery Batch Inversion** - Amortize 1 inverse across 255 keys (8x speedup potential)
+- **deltaX/lambda representation** - Reduce to ~2 field muls per iteration (vs current ~16)
 
 ### Architecture
 
@@ -174,12 +182,12 @@ The GPU uses a precomputation table of 8,160 elliptic curve points:
 
 | Tool | GPU Support | Speed | Platform |
 |------|-------------|-------|----------|
-| **eth-vanity-metal** | Metal (native) | **367 MH/s** | macOS (Apple Silicon) |
-| profanity2 | OpenCL | ~199 MH/s | Linux/Windows/macOS |
+| **profanity2** | OpenCL | **~100 MH/s** | Linux/Windows/macOS |
+| **eth-vanity-metal** | Metal (native) | ~45 MH/s | macOS (Apple Silicon) |
 | vanity-eth (Node) | CPU only | ~50 KH/s | Cross-platform |
 | ethvanity (Go) | CPU only | ~200 KH/s | Cross-platform |
 
-*Note: This is the only Metal-native implementation, optimized specifically for Apple Silicon Macs.*
+*Note: This is the only Metal-native implementation for Apple Silicon. Performance optimization is ongoing.*
 
 ## Ethereum Address Format
 
@@ -191,14 +199,30 @@ Unlike TRON (which uses Base58Check), Ethereum addresses are simpler:
 
 This means pattern matching is straightforward - what you search for is exactly what appears in the address!
 
+## Roadmap
+
+### Current Status: ~45 MH/s (Jacobian Coordinates)
+
+### Target: 100+ MH/s (profanity2-style Batch Inversion)
+
+- [ ] **Implement deltaX/lambda point representation** - Store `(deltaX, lambda)` instead of Jacobian `(X, Y, Z)`
+- [ ] **Montgomery batch inversion** - Amortize 1 modular inverse across 255 keys (currently each key does inline inversion)
+- [ ] **Optimize field multiplication** - Port profanity2's `mp_mod_mul` algorithm with fixed 8 iterations
+- [ ] **GLV endomorphism** - Use secp256k1 endomorphism for ~2x speedup on scalar multiplication
+- [ ] **Multi-GPU support** - Distribute work across multiple Metal devices
+
+### Why Metal Should Win
+
+Metal is Apple's native GPU API with lower overhead than OpenCL on Apple Silicon. With the same algorithm, Metal should achieve 100-150 MH/s. The current gap is due to algorithmic differences, not API limitations.
+
 ## Contributing
 
 Contributions welcome! Areas of interest:
 
+- Implementing profanity2-style batch inversion in Metal
 - GLV endomorphism optimization
 - Multi-GPU support
 - Further Metal shader optimizations
-- Batch-32 parallelism (currently batch-16 due to register pressure)
 - Support for EIP-55 checksum patterns
 
 ## License

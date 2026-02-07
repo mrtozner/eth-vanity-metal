@@ -186,16 +186,12 @@ void mul_mod(thread uint256_t& r, thread const uint256_t& a, thread const uint25
     }
 
     // Reduction: 2^256 ≡ 2^32 + 977 (mod P)
-    // So c[4..7] * 2^256 ≡ c[4..7] * (2^32 + 977)
-
-    // First: U * 977
     uint256_t U_times_977 = {{0,0,0,0}};
     ulong carry_977 = 0;
     for (int i = 0; i < 4; i++) {
         ulong prod_lo = U.d[i] * 977ULL;
         ulong prod_hi = metal::mulhi(U.d[i], 977ULL);
 
-        // Proper carry detection for addition
         ulong temp = U_times_977.d[i] + prod_lo;
         ulong c1 = (temp < U_times_977.d[i]) ? 1 : 0;
         ulong sum = temp + carry_977;
@@ -205,11 +201,8 @@ void mul_mod(thread uint256_t& r, thread const uint256_t& a, thread const uint25
         carry_977 = prod_hi + c1 + c2;
     }
 
-    // Add L + U*977
     uint carry_main = add_with_carry(r, L, U_times_977);
 
-    // Second: U * 2^32 (shift left by 32 bits)
-    // In 64-bit limbs, this shifts U left by half a limb
     ulong u_shift = U.d[0] << 32;
     ulong old_r0 = r.d[0];
     r.d[0] += u_shift;
@@ -226,27 +219,20 @@ void mul_mod(thread uint256_t& r, thread const uint256_t& a, thread const uint25
         shift_carry = c1 + c2;
     }
 
-    // Handle final overflow from all operations
-    // Include the upper 32 bits of U.d[3] that shifted out
     ulong total_overflow = carry_977 + carry_main + shift_carry + (U.d[3] >> 32);
 
-    // Apply second-level reduction: total_overflow * (2^32 + 977)
-    // This handles the overflow from the first reduction
     while (total_overflow > 0) {
-        // Multiply overflow by 977 and add to r[0]
         ulong val_977 = total_overflow * 977ULL;
         old_r0 = r.d[0];
         r.d[0] += val_977;
         ulong final_carry = (r.d[0] < old_r0) ? 1 : 0;
 
-        // Propagate carry
         for (int i = 1; i < 4 && final_carry; i++) {
             ulong old = r.d[i];
             r.d[i] += final_carry;
             final_carry = (r.d[i] < old) ? 1 : 0;
         }
 
-        // Add overflow * 2^32 (shift left 32 bits and add)
         ulong add_to_d0 = total_overflow << 32;
         ulong add_to_d1 = total_overflow >> 32;
 
@@ -268,11 +254,9 @@ void mul_mod(thread uint256_t& r, thread const uint256_t& a, thread const uint25
             carry2 = (r.d[i] < old) ? 1 : 0;
         }
 
-        // Any remaining carry becomes new overflow (should be very small)
         total_overflow = final_carry + carry2;
     }
 
-    // Final reductions to ensure result < P
     while (gte_const(r, SECP256K1_P)) {
         uint256_t tmp = r;
         sub_with_borrow_const(r, tmp, SECP256K1_P);
@@ -294,7 +278,8 @@ void mul_mod_const2(thread uint256_t& r, thread const uint256_t& a, constant uin
 }
 
 // Modular squaring: r = (a * a) mod P
-// Using mul_mod for correctness - optimized version had a bug
+// Delegates to mul_mod - on Apple Silicon GPU, the register-friendly loop
+// structure of mul_mod outperforms explicit symmetry optimization.
 void sqr_mod(thread uint256_t& r, thread const uint256_t& a) {
     mul_mod(r, a, a);
 }
@@ -1015,7 +1000,7 @@ void point_add_mixed(thread JacobianPoint& P) {
 // 7. Coordinate Conversion
 // ==========================================
 
-// Convert Jacobian point to Affine coordinates
+// Convert Jacobian point to Affine coordinates (standalone version)
 void jacobian_to_affine(thread JacobianPoint& P, thread uint256_t& x, thread uint256_t& y) {
     uint256_t z_inv, z_inv2, z_inv3;
 
@@ -1033,6 +1018,17 @@ void jacobian_to_affine(thread JacobianPoint& P, thread uint256_t& x, thread uin
 
     // y = Y / Z^3
     mul_mod(y, P.y, z_inv3);
+}
+
+// Convert Jacobian to affine in-place (for affine batch addition optimization)
+inline void jacobian_to_affine_inplace(thread uint256_t& ax, thread uint256_t& ay,
+                                        thread const JacobianPoint& P) {
+    uint256_t z_inv, z_inv2, z_inv3;
+    inv_mod(z_inv, P.z);
+    sqr_mod(z_inv2, z_inv);
+    mul_mod(z_inv3, z_inv2, z_inv);
+    mul_mod(ax, P.x, z_inv2);
+    mul_mod(ay, P.y, z_inv3);
 }
 
 // ==========================================
@@ -1557,7 +1553,7 @@ kernel void eth_vanity_search(
     device uint* result_thread_id             [[ buffer(6) ]],
     device uint* result_offset                [[ buffer(7) ]],
     constant uint& steps_per_thread           [[ buffer(8) ]],
-    // NOTE: precomp buffer removed - only used by generate_seeds kernel
+    constant AffinePoint* stride_table        [[ buffer(9) ]],
     uint gid [[ thread_position_in_grid ]])
 {
     if (atomic_load_explicit(found_flag, memory_order_relaxed) > 0) return;
@@ -1570,13 +1566,12 @@ kernel void eth_vanity_search(
         pattern_cache[k] = pattern[k];
     }
 
-    // Cache frequently accessed constants in thread-local memory for better performance
-    uint256_t local_P = SECP256K1_P;
-    uint256_t local_GX = G_X;
-    uint256_t local_GY = G_Y;
-
     // Process in batches of 16
     uint num_batches = steps_per_thread / 16;
+
+    // Initial: convert Jacobian starting point to affine (one-time cost)
+    uint256_t aff_px, aff_py;
+    jacobian_to_affine_inplace(aff_px, aff_py, P);
 
     for (uint batch = 0; batch < num_batches; batch++) {
         // Check found flag periodically
@@ -1584,52 +1579,57 @@ kernel void eth_vanity_search(
             if (atomic_load_explicit(found_flag, memory_order_relaxed) > 0) return;
         }
 
-        // --- PHASE 1: GENERATE 16 POINTS ---
-        JacobianPoint pts[16];
-        uint256_t zs[16];
-
-        point_add_mixed(P); pts[0] = P; zs[0] = P.z;
-        point_add_mixed(P); pts[1] = P; zs[1] = P.z;
-        point_add_mixed(P); pts[2] = P; zs[2] = P.z;
-        point_add_mixed(P); pts[3] = P; zs[3] = P.z;
-        point_add_mixed(P); pts[4] = P; zs[4] = P.z;
-        point_add_mixed(P); pts[5] = P; zs[5] = P.z;
-        point_add_mixed(P); pts[6] = P; zs[6] = P.z;
-        point_add_mixed(P); pts[7] = P; zs[7] = P.z;
-        point_add_mixed(P); pts[8] = P; zs[8] = P.z;
-        point_add_mixed(P); pts[9] = P; zs[9] = P.z;
-        point_add_mixed(P); pts[10] = P; zs[10] = P.z;
-        point_add_mixed(P); pts[11] = P; zs[11] = P.z;
-        point_add_mixed(P); pts[12] = P; zs[12] = P.z;
-        point_add_mixed(P); pts[13] = P; zs[13] = P.z;
-        point_add_mixed(P); pts[14] = P; zs[14] = P.z;
-        point_add_mixed(P); pts[15] = P; zs[15] = P.z;
-
-        // --- PHASE 2: BATCH INVERSE (1 inverse for 16 points) ---
-        batch_inverse_16(zs);
-
-        // --- PHASE 3: CONVERT & CHECK 16 ADDRESSES ---
+        // --- PHASE 1: COMPUTE X_DIFFS FOR BATCH INVERSE ---
+        uint256_t diffs[16];
         for (int k = 0; k < 16; k++) {
-            // Manual affine conversion using pre-calculated Z^-1
-            uint256_t z_inv = zs[k];
-            uint256_t z_inv2, z_inv3;
-            sqr_mod(z_inv2, z_inv);
-            mul_mod(z_inv3, z_inv2, z_inv);
+            // Copy constant to thread-local (Metal address space requirement)
+            uint256_t qx;
+            for (int i = 0; i < 4; i++) qx.d[i] = stride_table[k].x.d[i];
+            mod_sub(diffs[k], qx, aff_px);
+        }
 
-            uint256_t aff_x, aff_y;
-            mul_mod(aff_x, pts[k].x, z_inv2);
-            mul_mod(aff_y, pts[k].y, z_inv3);
+        // --- PHASE 2: BATCH INVERSE ALL 16 DENOMINATORS ---
+        batch_inverse_16(diffs);
+
+        // --- PHASE 3: COMPLETE AFFINE ADDITIONS + ADDRESS CHECKS ---
+        uint256_t next_px, next_py;
+        for (int k = 0; k < 16; k++) {
+            // Read stride table entry to thread-local
+            uint256_t qx, qy;
+            for (int i = 0; i < 4; i++) {
+                qx.d[i] = stride_table[k].x.d[i];
+                qy.d[i] = stride_table[k].y.d[i];
+            }
+
+            // Affine addition: P + kG
+            // s = (Q.y - P.y) * inv_diff
+            uint256_t dy, s;
+            mod_sub(dy, qy, aff_py);
+            mul_mod(s, dy, diffs[k]);
+
+            // x3 = s^2 - P.x - Q.x
+            uint256_t s2, x3;
+            sqr_mod(s2, s);
+            mod_sub(x3, s2, aff_px);
+            mod_sub(x3, x3, qx);
+
+            // y3 = s * (P.x - x3) - P.y
+            uint256_t dx, y3;
+            mod_sub(dx, aff_px, x3);
+            mul_mod(y3, s, dx);
+            mod_sub(y3, y3, aff_py);
+
+            // Save last point for next batch (P + 16G)
+            if (k == 15) {
+                next_px = x3;
+                next_py = y3;
+            }
 
             // --- CHECK 1: Original Point ---
             {
-                // Hash public key directly from uint256_t limbs (no byte serialization)
                 uchar hash[32];
-                keccak_256_from_uint256(aff_x, aff_y, hash);
-
-                // Check pattern match using optimized unrolled comparison
-                // ETH address = hash[12..31] (last 20 bytes)
+                keccak_256_from_uint256(x3, y3, hash);
                 bool match = check_pattern_fast(hash, pattern_cache, pattern_len, is_suffix != 0);
-
                 if (match) {
                     uint expected = 0;
                     if (atomic_compare_exchange_weak_explicit(
@@ -1642,32 +1642,29 @@ kernel void eth_vanity_search(
                 }
             }
 
-            // --- CHECK 2: GLV Endomorphism Point (free second address) ---
-            // ψ(x, y) = (β·x, y) gives a valid secp256k1 point
-            // Private key for this point is λ·k mod n
+            // --- CHECK 2: GLV Endomorphism ---
             {
                 uint256_t glv_x;
-                mul_mod_const2(glv_x, aff_x, BETA);
-                // y coordinate is unchanged for GLV endomorphism
-
+                mul_mod_const2(glv_x, x3, BETA);
                 uchar hash2[32];
-                keccak_256_from_uint256(glv_x, aff_y, hash2);
-
+                keccak_256_from_uint256(glv_x, y3, hash2);
                 bool match2 = check_pattern_fast(hash2, pattern_cache, pattern_len, is_suffix != 0);
-
                 if (match2) {
                     uint expected = 0;
                     if (atomic_compare_exchange_weak_explicit(
                             found_flag, &expected, 1,
                             memory_order_relaxed, memory_order_relaxed)) {
                         *result_thread_id = gid;
-                        // Use bit 31 to signal GLV variant to host
                         *result_offset = ((batch * 16) + k + 1) | 0x80000000u;
                     }
                     return;
                 }
             }
         }
+
+        // Update P for next batch
+        aff_px = next_px;
+        aff_py = next_py;
     }
 }
 

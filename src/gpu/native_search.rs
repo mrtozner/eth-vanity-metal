@@ -133,6 +133,42 @@ pub fn generate_gpu_seeds(
 }
 
 // ==========================================
+// Stride Table Precomputation
+// ==========================================
+
+/// Compute stride table: kG for k=1..16
+/// Each point is encoded as two uint256_t values (x, y), each with 4 little-endian 64-bit limbs
+fn compute_stride_table() -> Vec<u8> {
+    let secp = secp256k1::Secp256k1::new();
+    let mut table = Vec::new();
+
+    for k in 1u64..=16 {
+        // Create scalar for k
+        let mut scalar_bytes = [0u8; 32];
+        scalar_bytes[24..32].copy_from_slice(&k.to_be_bytes());
+        let key = secp256k1::SecretKey::from_slice(&scalar_bytes).unwrap();
+        let pubkey = secp256k1::PublicKey::from_secret_key(&secp, &key);
+        let serialized = pubkey.serialize_uncompressed(); // 04 || x(32) || y(32)
+
+        // Convert x and y from big-endian bytes to little-endian 64-bit limbs
+        for coord in [&serialized[1..33], &serialized[33..65]] {
+            // coord is 32 bytes in big-endian
+            // We need to convert to 4 limbs in little-endian order
+            // Limb order: d[0] = LSB, d[1], d[2], d[3] = MSB
+            // Byte layout in big-endian: [MSB...LSB]
+            // So: d[3] <- bytes[0..7], d[2] <- bytes[8..15], d[1] <- bytes[16..23], d[0] <- bytes[24..31]
+            for limb_idx in 0..4 {
+                let offset = (3 - limb_idx) * 8; // d[0] <- bytes[24..31] (LSB), d[3] <- bytes[0..7] (MSB)
+                let limb = u64::from_be_bytes(coord[offset..offset+8].try_into().unwrap());
+                table.extend_from_slice(&limb.to_le_bytes());
+            }
+        }
+    }
+
+    table
+}
+
+// ==========================================
 // GPU Search Execution
 // ==========================================
 
@@ -143,6 +179,7 @@ pub struct GpuNativeSearcher {
     num_threads: usize,
     steps_per_thread: u32,
     precomp_buffer: metal::Buffer,
+    stride_table_buffer: metal::Buffer,
 }
 
 impl GpuNativeSearcher {
@@ -218,6 +255,22 @@ impl GpuNativeSearcher {
                  precomp_buffer_size / 1024);
         std::io::stdout().flush().unwrap();
 
+        // Generate and upload stride table for affine batch addition
+        println!("  → Generating stride table [G, 2G, ..., 16G]...");
+        std::io::stdout().flush().unwrap();
+
+        let stride_table = compute_stride_table();
+        let stride_table_size = stride_table.len() as u64;
+        let stride_table_buffer = context.device().new_buffer_with_data(
+            stride_table.as_ptr() as *const _,
+            stride_table_size,
+            metal::MTLResourceOptions::StorageModeShared,
+        );
+
+        println!("  → Stride table uploaded to GPU ({} bytes)",
+                 stride_table_size);
+        std::io::stdout().flush().unwrap();
+
         Ok(Self {
             context,
             pipeline,
@@ -225,6 +278,7 @@ impl GpuNativeSearcher {
             num_threads,
             steps_per_thread,
             precomp_buffer,
+            stride_table_buffer,
         })
     }
 
@@ -369,7 +423,7 @@ impl GpuNativeSearcher {
         encoder.set_buffer(6, Some(&result_thread_buffer), 0);
         encoder.set_buffer(7, Some(&result_offset_buffer), 0);
         encoder.set_buffer(8, Some(&steps_buffer), 0);
-        // Note: precomp_buffer is only used by generate_seeds kernel, not this kernel
+        encoder.set_buffer(9, Some(&self.stride_table_buffer), 0);
 
         // Dispatch threads
         let threadgroup_size = 256.min(self.pipeline.max_total_threads_per_threadgroup()) as u64;

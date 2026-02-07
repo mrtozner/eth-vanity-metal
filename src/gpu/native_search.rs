@@ -6,6 +6,16 @@ use secp256k1::{SecretKey, Secp256k1, Scalar};
 use std::sync::Arc;
 use std::io::Write;
 
+/// GLV endomorphism eigenvalue λ for secp256k1
+/// λ·G has the same x-coordinate as β·G.x (mod p)
+/// λ = 0x5363AD4CC05C30E0A5261C028812645A122E22EA20816678DF02967C1B23BD72
+const GLV_LAMBDA: [u8; 32] = [
+    0x53, 0x63, 0xAD, 0x4C, 0xC0, 0x5C, 0x30, 0xE0,
+    0xA5, 0x26, 0x1C, 0x02, 0x88, 0x12, 0x64, 0x5A,
+    0x12, 0x2E, 0x22, 0xEA, 0x20, 0x81, 0x66, 0x78,
+    0xDF, 0x02, 0x96, 0x7C, 0x1B, 0x23, 0xBD, 0x72,
+];
+
 // ==========================================
 // GPU-Compatible Structs
 // ==========================================
@@ -391,32 +401,48 @@ impl GpuNativeSearcher {
 }
 
 /// Recover private key from GPU search result
+/// If offset has bit 31 set, it's a GLV endomorphism result:
+/// the actual private key is λ * (base_key + real_offset) mod n
 pub fn recover_private_key(
     base_key: &SecretKey,
     thread_id: u32,
     offset: u32,
     steps_per_thread: u64,
 ) -> Result<SecretKey, String> {
+    // Check GLV flag (bit 31 of offset)
+    let is_glv = (offset & 0x80000000) != 0;
+    let real_offset = offset & 0x7FFFFFFF;
+
     let _secp = Secp256k1::new();
-    
-    // Calculate total offset: thread_id * steps_per_thread + offset
+
+    // Calculate total offset: thread_id * steps_per_thread + real_offset
     let thread_offset = (thread_id as u64)
         .checked_mul(steps_per_thread)
         .ok_or("Thread offset overflow")?;
-    
+
     let total_offset = thread_offset
-        .checked_add(offset as u64)
+        .checked_add(real_offset as u64)
         .ok_or("Total offset overflow")?;
-    
+
     // Convert to scalar
     let offset_bytes = total_offset.to_be_bytes();
     let mut scalar_bytes = [0u8; 32];
     scalar_bytes[24..32].copy_from_slice(&offset_bytes);
-    
+
     let offset_scalar = Scalar::from_be_bytes(scalar_bytes)
         .map_err(|_| "Invalid scalar")?;
-    
-    // Add offset to base key
-    base_key.add_tweak(&offset_scalar)
-        .map_err(|e| format!("Key addition failed: {}", e))
+
+    // Add offset to base key: k = base_key + offset
+    let mut key = base_key.add_tweak(&offset_scalar)
+        .map_err(|e| format!("Key addition failed: {}", e))?;
+
+    // If GLV match, multiply by lambda: k' = λ * k mod n
+    if is_glv {
+        let lambda_scalar = Scalar::from_be_bytes(GLV_LAMBDA)
+            .map_err(|_| "Invalid lambda scalar")?;
+        key = key.mul_tweak(&lambda_scalar)
+            .map_err(|e| format!("GLV multiplication failed: {}", e))?;
+    }
+
+    Ok(key)
 }

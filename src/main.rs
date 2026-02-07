@@ -381,14 +381,30 @@ fn run_gpu_native_search(
             // Recover the private key
             let found_key = recover_private_key(&base_key, thread_id, offset, steps_per_thread as u64)?;
 
-            // Generate address
+            // Generate and verify address on CPU (security: never trust GPU-only results)
             let secp = secp256k1::Secp256k1::new();
             let pub_key = secp256k1::PublicKey::from_secret_key(&secp, &found_key);
             let address = public_key_to_eth_address(&pub_key);
             let private_hex = private_key_to_hex(&found_key);
 
+            // Check if this is a GLV match
+            let is_glv = (offset & 0x80000000) != 0;
+
+            // Verify the address actually matches the pattern on CPU
+            let addr_hex = &address[2..].to_lowercase();
+            let pattern_lower = pattern_str.to_lowercase();
+            let verified = if is_suffix {
+                addr_hex.ends_with(&pattern_lower)
+            } else {
+                addr_hex.starts_with(&pattern_lower)
+            };
+
+            if !verified {
+                continue;
+            }
+
             found_count += 1;
-            println!("\n\n✓ Found vanity address!");
+            println!("\n\n✓ Found vanity address!{}", if is_glv { " (via GLV endomorphism)" } else { "" });
             println!("========================");
             println!("Address:      {}", address);
             println!("Private Key:  {}", private_hex);
@@ -396,13 +412,14 @@ fn run_gpu_native_search(
         }
 
         batch_count += 1;
-        let total_keys = batch_count * (num_threads as u64) * (steps_per_thread as u64);
+        // Each EC point yields 2 address checks (original + GLV endomorphism)
+        let total_keys = batch_count * (num_threads as u64) * (steps_per_thread as u64) * 2;
         attempts.store(total_keys, Ordering::Relaxed);
 
         // Update progress
         let elapsed = start_time.elapsed();
         let rate = total_keys as f64 / elapsed.as_secs_f64();
-        print!("\r[GPU-Native] Found: {} | Scanned: {} | Speed: {:.2}M keys/s | Time: {}s   ",
+        print!("\r[GPU-Native+GLV] Found: {} | Scanned: {} | Speed: {:.2}M addr/s | Time: {}s   ",
             found_count,
             format_number(total_keys),
             rate / 1_000_000.0,

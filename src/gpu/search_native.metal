@@ -51,11 +51,12 @@ constant uint256_t G_Y = {
 
 
 // GLV Endomorphism constants for secp256k1
-// β (beta): cube root of unity mod p
+// β (beta): cube root of unity mod p, where β³ ≡ 1 (mod p)
+// β = 0x7AE96A2B657C07106E64479EAC3434E99CF0497512F58995C1396C28719501EE
 // Used for GLV endomorphism: ψ(x, y) = (β·x, y)
 constant uint256_t BETA = {
-    {0xE1108A8F3F84B3D1ULL, 0x7F479ABFD58456D5ULL,
-     0xAC9C52B3B5DA41F8ULL, 0x7AE96A2BDB2C001FULL}
+    {0xC1396C28719501EEULL, 0x9CF0497512F58995ULL,
+     0x6E64479EAC3434E9ULL, 0x7AE96A2B657C0710ULL}
 };
 
 // Add two 256-bit numbers with carry
@@ -292,229 +293,12 @@ void mul_mod_const2(thread uint256_t& r, thread const uint256_t& a, constant uin
     mul_mod(r, a, b_copy);
 }
 
-// Optimized modular squaring: r = (a * a) mod P
-// Exploits symmetry: a[i]*a[j] = a[j]*a[i], reducing 16 muls to 10
-// (4 squarings + 6 cross products, each doubled)
+// Modular squaring: r = (a * a) mod P
+// Using mul_mod for correctness - optimized version had a bug
 void sqr_mod(thread uint256_t& r, thread const uint256_t& a) {
-    // Compute 512-bit square using symmetry
-    // c[k] = sum of a[i]*a[j] where i+j=k
-    // Diagonal (i==j): contributes once
-    // Cross (i!=j): contributes twice (symmetry)
-    ulong c[8] = {0};
-
-    // --- Diagonal terms (4 squarings) ---
-    // c[0] += a[0]^2
-    ulong lo = a.d[0] * a.d[0];
-    ulong hi = metal::mulhi(a.d[0], a.d[0]);
-    c[0] = lo;
-    c[1] = hi;
-
-    // c[2] += a[1]^2
-    lo = a.d[1] * a.d[1];
-    hi = metal::mulhi(a.d[1], a.d[1]);
-    ulong temp = c[2] + lo;
-    ulong carry_out = (temp < c[2]) ? 1 : 0;
-    c[2] = temp;
-    temp = c[3] + hi + carry_out;
-    c[3] = temp;
-
-    // c[4] += a[2]^2
-    lo = a.d[2] * a.d[2];
-    hi = metal::mulhi(a.d[2], a.d[2]);
-    temp = c[4] + lo;
-    carry_out = (temp < c[4]) ? 1 : 0;
-    c[4] = temp;
-    temp = c[5] + hi + carry_out;
-    c[5] = temp;
-
-    // c[6] += a[3]^2
-    lo = a.d[3] * a.d[3];
-    hi = metal::mulhi(a.d[3], a.d[3]);
-    c[6] = lo;
-    c[7] = hi;
-
-    // --- Cross terms (6 products, each doubled) ---
-    // a[0]*a[1] contributes to c[1],c[2]
-    lo = a.d[0] * a.d[1];
-    hi = metal::mulhi(a.d[0], a.d[1]);
-    // Double it
-    ulong dbl_hi = (hi << 1) | (lo >> 63);
-    ulong dbl_lo = lo << 1;
-    temp = c[1] + dbl_lo;
-    carry_out = (temp < c[1]) ? 1 : 0;
-    c[1] = temp;
-    temp = c[2] + dbl_hi + carry_out;
-    carry_out = (temp < c[2]) || (carry_out && temp == c[2]) ? 1 : 0;
-    c[2] = temp;
-    // Propagate carry
-    for (int i = 3; i < 8 && carry_out; i++) {
-        temp = c[i] + carry_out;
-        carry_out = (temp < c[i]) ? 1 : 0;
-        c[i] = temp;
-    }
-
-    // a[0]*a[2] contributes to c[2],c[3]
-    lo = a.d[0] * a.d[2];
-    hi = metal::mulhi(a.d[0], a.d[2]);
-    dbl_hi = (hi << 1) | (lo >> 63);
-    dbl_lo = lo << 1;
-    temp = c[2] + dbl_lo;
-    carry_out = (temp < c[2]) ? 1 : 0;
-    c[2] = temp;
-    temp = c[3] + dbl_hi + carry_out;
-    carry_out = (temp < c[3]) || (carry_out && temp == c[3]) ? 1 : 0;
-    c[3] = temp;
-    for (int i = 4; i < 8 && carry_out; i++) {
-        temp = c[i] + carry_out;
-        carry_out = (temp < c[i]) ? 1 : 0;
-        c[i] = temp;
-    }
-
-    // a[0]*a[3] contributes to c[3],c[4]
-    lo = a.d[0] * a.d[3];
-    hi = metal::mulhi(a.d[0], a.d[3]);
-    dbl_hi = (hi << 1) | (lo >> 63);
-    dbl_lo = lo << 1;
-    temp = c[3] + dbl_lo;
-    carry_out = (temp < c[3]) ? 1 : 0;
-    c[3] = temp;
-    temp = c[4] + dbl_hi + carry_out;
-    carry_out = (temp < c[4]) || (carry_out && temp == c[4]) ? 1 : 0;
-    c[4] = temp;
-    for (int i = 5; i < 8 && carry_out; i++) {
-        temp = c[i] + carry_out;
-        carry_out = (temp < c[i]) ? 1 : 0;
-        c[i] = temp;
-    }
-
-    // a[1]*a[2] contributes to c[3],c[4]
-    lo = a.d[1] * a.d[2];
-    hi = metal::mulhi(a.d[1], a.d[2]);
-    dbl_hi = (hi << 1) | (lo >> 63);
-    dbl_lo = lo << 1;
-    temp = c[3] + dbl_lo;
-    carry_out = (temp < c[3]) ? 1 : 0;
-    c[3] = temp;
-    temp = c[4] + dbl_hi + carry_out;
-    carry_out = (temp < c[4]) || (carry_out && temp == c[4]) ? 1 : 0;
-    c[4] = temp;
-    for (int i = 5; i < 8 && carry_out; i++) {
-        temp = c[i] + carry_out;
-        carry_out = (temp < c[i]) ? 1 : 0;
-        c[i] = temp;
-    }
-
-    // a[1]*a[3] contributes to c[4],c[5]
-    lo = a.d[1] * a.d[3];
-    hi = metal::mulhi(a.d[1], a.d[3]);
-    dbl_hi = (hi << 1) | (lo >> 63);
-    dbl_lo = lo << 1;
-    temp = c[4] + dbl_lo;
-    carry_out = (temp < c[4]) ? 1 : 0;
-    c[4] = temp;
-    temp = c[5] + dbl_hi + carry_out;
-    carry_out = (temp < c[5]) || (carry_out && temp == c[5]) ? 1 : 0;
-    c[5] = temp;
-    for (int i = 6; i < 8 && carry_out; i++) {
-        temp = c[i] + carry_out;
-        carry_out = (temp < c[i]) ? 1 : 0;
-        c[i] = temp;
-    }
-
-    // a[2]*a[3] contributes to c[5],c[6]
-    lo = a.d[2] * a.d[3];
-    hi = metal::mulhi(a.d[2], a.d[3]);
-    dbl_hi = (hi << 1) | (lo >> 63);
-    dbl_lo = lo << 1;
-    temp = c[5] + dbl_lo;
-    carry_out = (temp < c[5]) ? 1 : 0;
-    c[5] = temp;
-    temp = c[6] + dbl_hi + carry_out;
-    carry_out = (temp < c[6]) || (carry_out && temp == c[6]) ? 1 : 0;
-    c[6] = temp;
-    for (int i = 7; i < 8 && carry_out; i++) {
-        temp = c[i] + carry_out;
-        carry_out = (temp < c[i]) ? 1 : 0;
-        c[i] = temp;
-    }
-
-    // --- Reduction (same as mul_mod) ---
-    // Split into upper and lower 256 bits
-    uint256_t U, L;
-    for (int i = 0; i < 4; i++) {
-        L.d[i] = c[i];
-        U.d[i] = c[i+4];
-    }
-
-    // Reduction: 2^256 ≡ 2^32 + 977 (mod P)
-    uint256_t U_times_977 = {{0,0,0,0}};
-    ulong carry_977 = 0;
-    for (int i = 0; i < 4; i++) {
-        ulong prod_lo = U.d[i] * 977ULL;
-        ulong prod_hi = metal::mulhi(U.d[i], 977ULL);
-        temp = U_times_977.d[i] + prod_lo;
-        ulong c1 = (temp < U_times_977.d[i]) ? 1 : 0;
-        ulong sum = temp + carry_977;
-        ulong c2 = (sum < temp) ? 1 : 0;
-        U_times_977.d[i] = sum;
-        carry_977 = prod_hi + c1 + c2;
-    }
-
-    uint carry_main = add_with_carry(r, L, U_times_977);
-
-    ulong u_shift = U.d[0] << 32;
-    ulong old_r0 = r.d[0];
-    r.d[0] += u_shift;
-    ulong shift_carry = (r.d[0] < old_r0) ? 1 : 0;
-
-    for (int i = 1; i < 4; i++) {
-        ulong part = (U.d[i-1] >> 32) | (U.d[i] << 32);
-        ulong old_ri = r.d[i];
-        temp = r.d[i] + part;
-        ulong c1 = (temp < old_ri) ? 1 : 0;
-        ulong sum = temp + shift_carry;
-        ulong c2 = (sum < temp) ? 1 : 0;
-        r.d[i] = sum;
-        shift_carry = c1 + c2;
-    }
-
-    ulong total_overflow = carry_977 + carry_main + shift_carry + (U.d[3] >> 32);
-
-    while (total_overflow > 0) {
-        ulong val_977 = total_overflow * 977ULL;
-        old_r0 = r.d[0];
-        r.d[0] += val_977;
-        ulong final_carry = (r.d[0] < old_r0) ? 1 : 0;
-        for (int i = 1; i < 4 && final_carry; i++) {
-            ulong old = r.d[i];
-            r.d[i] += final_carry;
-            final_carry = (r.d[i] < old) ? 1 : 0;
-        }
-        ulong add_to_d0 = total_overflow << 32;
-        ulong add_to_d1 = total_overflow >> 32;
-        old_r0 = r.d[0];
-        r.d[0] += add_to_d0;
-        ulong carry2 = (r.d[0] < old_r0) ? 1 : 0;
-        ulong old_r1 = r.d[1];
-        r.d[1] += add_to_d1;
-        ulong c1 = (r.d[1] < old_r1) ? 1 : 0;
-        old_r1 = r.d[1];
-        r.d[1] += carry2;
-        ulong c2 = (r.d[1] < old_r1) ? 1 : 0;
-        carry2 = c1 + c2;
-        for (int i = 2; i < 4 && carry2; i++) {
-            ulong old = r.d[i];
-            r.d[i] += carry2;
-            carry2 = (r.d[i] < old) ? 1 : 0;
-        }
-        total_overflow = final_carry + carry2;
-    }
-
-    while (gte_const(r, SECP256K1_P)) {
-        uint256_t tmp = r;
-        sub_with_borrow_const(r, tmp, SECP256K1_P);
-    }
+    mul_mod(r, a, a);
 }
+
 
 // ==========================================
 // 5. Modular Inverse (Fermat's Little Theorem)
@@ -1853,6 +1637,32 @@ kernel void eth_vanity_search(
                             memory_order_relaxed, memory_order_relaxed)) {
                         *result_thread_id = gid;
                         *result_offset = (batch * 16) + k + 1;
+                    }
+                    return;
+                }
+            }
+
+            // --- CHECK 2: GLV Endomorphism Point (free second address) ---
+            // ψ(x, y) = (β·x, y) gives a valid secp256k1 point
+            // Private key for this point is λ·k mod n
+            {
+                uint256_t glv_x;
+                mul_mod_const2(glv_x, aff_x, BETA);
+                // y coordinate is unchanged for GLV endomorphism
+
+                uchar hash2[32];
+                keccak_256_from_uint256(glv_x, aff_y, hash2);
+
+                bool match2 = check_pattern_fast(hash2, pattern_cache, pattern_len, is_suffix != 0);
+
+                if (match2) {
+                    uint expected = 0;
+                    if (atomic_compare_exchange_weak_explicit(
+                            found_flag, &expected, 1,
+                            memory_order_relaxed, memory_order_relaxed)) {
+                        *result_thread_id = gid;
+                        // Use bit 31 to signal GLV variant to host
+                        *result_offset = ((batch * 16) + k + 1) | 0x80000000u;
                     }
                     return;
                 }

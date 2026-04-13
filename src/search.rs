@@ -1,4 +1,6 @@
-use crate::address::{SequentialGenerator, public_key_to_eth_address, private_key_to_hex};
+use crate::address::{
+    eth_address_matches_patterns, private_key_to_hex, public_key_to_eth_address, SequentialGenerator,
+};
 use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -36,15 +38,11 @@ pub fn search_continuous(
         
         attempts.fetch_add(1, Ordering::Relaxed);
         
-        // Check pattern match
-        let matches = if let Some(ref prefix) = config.prefix {
-            // Skip "0x" prefix when checking
-            address[2..].to_lowercase().starts_with(&prefix.to_lowercase())
-        } else if let Some(ref suffix) = config.suffix {
-            address.to_lowercase().ends_with(&suffix.to_lowercase())
-        } else {
-            false
-        };
+        let matches = eth_address_matches_patterns(
+            &address,
+            config.prefix.as_deref(),
+            config.suffix.as_deref(),
+        );
         
         if matches {
             if !found.swap(true, Ordering::SeqCst) {

@@ -55,6 +55,26 @@ pub fn private_key_to_hex(secret_key: &SecretKey) -> String {
     hex::encode(secret_key.secret_bytes())
 }
 
+/// `address` may include a `0x` prefix. All constraints are ANDed; omitted constraints are ignored.
+/// Returns false if both `prefix` and `suffix` are `None`.
+pub fn eth_address_matches_patterns(
+    address: &str,
+    prefix: Option<&str>,
+    suffix: Option<&str>,
+) -> bool {
+    if prefix.is_none() && suffix.is_none() {
+        return false;
+    }
+    let body = address
+        .strip_prefix("0x")
+        .or_else(|| address.strip_prefix("0X"))
+        .unwrap_or(address)
+        .to_lowercase();
+    let prefix_ok = prefix.map_or(true, |p| body.starts_with(&p.to_lowercase()));
+    let suffix_ok = suffix.map_or(true, |s| body.ends_with(&s.to_lowercase()));
+    prefix_ok && suffix_ok
+}
+
 /// Sequential keypair generator - MUCH faster than random generation!
 ///
 /// Instead of generating a random private key for every attempt (which requires

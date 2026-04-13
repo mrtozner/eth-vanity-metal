@@ -4,7 +4,6 @@
 /// - Store (deltaX, prevLambda) instead of (X, Y, Z)
 /// - Batch inverse 255 values with 1 inverse
 /// - Point iteration with only 2 field multiplications
-
 use crate::gpu::{GpuError, MetalContext};
 use metal::{Buffer, ComputePipelineState, Device, MTLResourceOptions, MTLSize};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -147,9 +146,9 @@ impl ProfanityBatchSearcher {
     /// This computes the initial deltaX and prevLambda values
     /// Optimized: Uses sequential keys with point addition for 10-100x speedup
     pub fn initialize_points(&mut self) -> Result<(), GpuError> {
-        use rayon::prelude::*;
         use k256::elliptic_curve::sec1::ToEncodedPoint;
-        use k256::{SecretKey as K256SecretKey, ProjectivePoint, AffinePoint};
+        use k256::{AffinePoint, ProjectivePoint, SecretKey as K256SecretKey};
+        use rayon::prelude::*;
 
         let start_time = std::time::Instant::now();
         println!("  Initializing {} points (optimized)...", TOTAL_POINTS);
@@ -205,7 +204,10 @@ impl ProfanityBatchSearcher {
         println!(" done ({:.2}s)", start_time.elapsed().as_secs_f64());
 
         // Step 4: Compute all points using lookup table and point addition
-        print!("  Computing {} points using point addition...", TOTAL_POINTS);
+        print!(
+            "  Computing {} points using point addition...",
+            TOTAL_POINTS
+        );
         std::io::Write::flush(&mut std::io::stdout()).unwrap();
 
         // secp256k1 field prime p
@@ -237,66 +239,70 @@ impl ProfanityBatchSearcher {
                 let start_idx = chunk_idx * chunk_size;
                 let end_idx = ((chunk_idx + 1) * chunk_size).min(TOTAL_POINTS);
 
-                (start_idx..end_idx).map(|i| {
-                    // Compute private key: base_key + i
-                    let privkey = add_to_private_key(base_key_bytes.as_ref(), i as u64);
+                (start_idx..end_idx)
+                    .map(|i| {
+                        // Compute private key: base_key + i
+                        let privkey = add_to_private_key(base_key_bytes.as_ref(), i as u64);
 
-                    // Compute public key using point addition with byte decomposition
-                    // point[i] = base_point + i*G
-                    // Decompose i into bytes: i = b0 + b1*256 + b2*256^2 + b3*256^3
-                    // Then: point[i] = base_point + b0*G + b1*256G + b2*256^2*G + b3*256^3*G
+                        // Compute public key using point addition with byte decomposition
+                        // point[i] = base_point + i*G
+                        // Decompose i into bytes: i = b0 + b1*256 + b2*256^2 + b3*256^3
+                        // Then: point[i] = base_point + b0*G + b1*256G + b2*256^2*G + b3*256^3*G
 
-                    let mut point_projective = base_point_projective;
+                        let mut point_projective = base_point_projective;
 
-                    // Extract bytes from index (little-endian)
-                    let bytes = [
-                        (i & 0xFF) as u8,
-                        ((i >> 8) & 0xFF) as u8,
-                        ((i >> 16) & 0xFF) as u8,
-                        ((i >> 24) & 0xFF) as u8,
-                    ];
+                        // Extract bytes from index (little-endian)
+                        let bytes = [
+                            (i & 0xFF) as u8,
+                            ((i >> 8) & 0xFF) as u8,
+                            ((i >> 16) & 0xFF) as u8,
+                            ((i >> 24) & 0xFF) as u8,
+                        ];
 
-                    // Add contribution from each non-zero byte
-                    for (pos, &byte_val) in bytes.iter().enumerate() {
-                        if byte_val > 0 && pos < NUM_BYTE_POSITIONS {
-                            // lookup_table[pos][byte_val - 1] = byte_val * 256^pos * G
-                            point_projective = point_projective +
-                                ProjectivePoint::from(lookup_table[pos][byte_val as usize - 1]);
+                        // Add contribution from each non-zero byte
+                        for (pos, &byte_val) in bytes.iter().enumerate() {
+                            if byte_val > 0 && pos < NUM_BYTE_POSITIONS {
+                                // lookup_table[pos][byte_val - 1] = byte_val * 256^pos * G
+                                point_projective = point_projective
+                                    + ProjectivePoint::from(
+                                        lookup_table[pos][byte_val as usize - 1],
+                                    );
+                            }
                         }
-                    }
 
-                    let point_affine = point_projective.to_affine();
-                    let point_encoded = point_affine.to_encoded_point(false);
-                    let x_bytes = point_encoded.x().unwrap();
-                    let y_bytes = point_encoded.y().unwrap();
+                        let point_affine = point_projective.to_affine();
+                        let point_encoded = point_affine.to_encoded_point(false);
+                        let x_bytes = point_encoded.x().unwrap();
+                        let y_bytes = point_encoded.y().unwrap();
 
-                    // Convert to BigUint for profanity2 representation
-                    let px = num_bigint::BigUint::from_bytes_be(x_bytes);
-                    let py = num_bigint::BigUint::from_bytes_be(y_bytes);
+                        // Convert to BigUint for profanity2 representation
+                        let px = num_bigint::BigUint::from_bytes_be(x_bytes);
+                        let py = num_bigint::BigUint::from_bytes_be(y_bytes);
 
-                    // deltaX = px - gx (mod p)
-                    let delta_x = if px >= gx {
-                        &px - &gx
-                    } else {
-                        &p - (&gx - &px)
-                    };
+                        // deltaX = px - gx (mod p)
+                        let delta_x = if px >= gx {
+                            &px - &gx
+                        } else {
+                            &p - (&gx - &px)
+                        };
 
-                    // prevLambda = (py - gy) / (px - gx) mod p
-                    let num = if py >= gy {
-                        &py - &gy
-                    } else {
-                        &p - (&gy - &py)
-                    };
+                        // prevLambda = (py - gy) / (px - gx) mod p
+                        let num = if py >= gy {
+                            &py - &gy
+                        } else {
+                            &p - (&gy - &py)
+                        };
 
-                    let delta_x_inv = mod_inverse(&delta_x, &p);
-                    let prev_lambda = (&num * &delta_x_inv) % &p;
+                        let delta_x_inv = mod_inverse(&delta_x, &p);
+                        let prev_lambda = (&num * &delta_x_inv) % &p;
 
-                    // Convert to 8 x u32 (little-endian words)
-                    let delta_x_words = biguint_to_words(&delta_x);
-                    let lambda_words = biguint_to_words(&prev_lambda);
+                        // Convert to 8 x u32 (little-endian words)
+                        let delta_x_words = biguint_to_words(&delta_x);
+                        let lambda_words = biguint_to_words(&prev_lambda);
 
-                    (privkey, delta_x_words, lambda_words)
-                }).collect::<Vec<_>>()
+                        (privkey, delta_x_words, lambda_words)
+                    })
+                    .collect::<Vec<_>>()
             })
             .collect();
 
@@ -328,8 +334,11 @@ impl ProfanityBatchSearcher {
 
         let total_time = start_time.elapsed().as_secs_f64();
         println!(" done");
-        println!("  Total initialization time: {:.2}s ({:.0} points/sec)",
-                 total_time, TOTAL_POINTS as f64 / total_time);
+        println!(
+            "  Total initialization time: {:.2}s ({:.0} points/sec)",
+            total_time,
+            TOTAL_POINTS as f64 / total_time
+        );
 
         Ok(())
     }
@@ -394,10 +403,8 @@ impl ProfanityBatchSearcher {
             encoder.set_buffer(5, Some(&self.is_suffix_buffer), 0);
 
             let thread_count = TOTAL_POINTS as u64;
-            let threads_per_group = std::cmp::min(
-                self.score_pipeline.max_total_threads_per_threadgroup(),
-                256,
-            );
+            let threads_per_group =
+                std::cmp::min(self.score_pipeline.max_total_threads_per_threadgroup(), 256);
             let threadgroups = (thread_count + threads_per_group - 1) / threads_per_group;
 
             encoder.dispatch_thread_groups(
@@ -434,7 +441,10 @@ impl ProfanityBatchSearcher {
         // Read GPU address hashes
         let hash_ptr = self.address_hash_buffer.contents() as *const u32;
 
-        println!("\n=== DEBUG: Comparing first {} addresses (iteration {}) ===", count, iteration);
+        println!(
+            "\n=== DEBUG: Comparing first {} addresses (iteration {}) ===",
+            count, iteration
+        );
 
         for i in 0..count.min(self.private_keys.len()) {
             // Read GPU address (5 x u32 = 20 bytes)
@@ -481,7 +491,10 @@ impl ProfanityBatchSearcher {
                 "✗ MISMATCH"
             };
 
-            println!("[{}] GPU: {} | CPU: {} {}", i, gpu_hex, cpu_address, match_str);
+            println!(
+                "[{}] GPU: {} | CPU: {} {}",
+                i, gpu_hex, cpu_address, match_str
+            );
         }
         println!("=== END DEBUG ===\n");
     }
@@ -624,7 +637,8 @@ pub fn debug_test_keccak(ctx: &MetalContext) -> Result<(), GpuError> {
     // Compile shader
     let shader_source = include_str!("profanity_batch.metal");
     let options = metal::CompileOptions::new();
-    let library = ctx.device
+    let library = ctx
+        .device
         .new_library_with_source(shader_source, &options)
         .map_err(|e| GpuError::ShaderCompilationFailed(e.to_string()))?;
 
@@ -647,12 +661,22 @@ pub fn debug_test_keccak(ctx: &MetalContext) -> Result<(), GpuError> {
     );
 
     // Get kernel function
-    let kernel = library.get_function("debug_keccak_test", None)
-        .map_err(|e| GpuError::PipelineCreationFailed(format!("Failed to get debug_keccak_test kernel: {}", e)))?;
+    let kernel = library
+        .get_function("debug_keccak_test", None)
+        .map_err(|e| {
+            GpuError::PipelineCreationFailed(format!(
+                "Failed to get debug_keccak_test kernel: {}",
+                e
+            ))
+        })?;
 
     // Create pipeline
-    let pipeline = ctx.device.new_compute_pipeline_state_with_function(&kernel)
-        .map_err(|e| GpuError::PipelineCreationFailed(format!("Failed to create pipeline: {}", e)))?;
+    let pipeline = ctx
+        .device
+        .new_compute_pipeline_state_with_function(&kernel)
+        .map_err(|e| {
+            GpuError::PipelineCreationFailed(format!("Failed to create pipeline: {}", e))
+        })?;
 
     // Execute kernel
     let command_buffer = ctx.command_queue.new_command_buffer();
@@ -685,7 +709,8 @@ pub fn debug_test_keccak(ctx: &MetalContext) -> Result<(), GpuError> {
 
     if cpu_address != gpu_address {
         return Err(GpuError::InitializationFailed(format!(
-            "GPU Keccak mismatch! CPU: {}, GPU: {}", cpu_address, gpu_address
+            "GPU Keccak mismatch! CPU: {}, GPU: {}",
+            cpu_address, gpu_address
         )));
     }
 
@@ -697,6 +722,8 @@ pub fn search_profanity_batch(
     ctx: &MetalContext,
     pattern: &[u8],
     is_suffix: bool,
+    prefix: Option<&str>,
+    suffix: Option<&str>,
     stop_signal: Arc<AtomicBool>,
     progress_callback: impl Fn(u64, f64),
 ) -> Result<Option<([u8; 32], String)>, GpuError> {
@@ -739,7 +766,9 @@ pub fn search_profanity_batch(
 
                 let actual_privkey = add_to_private_key(&original_privkey, iter + 1);
                 let address = compute_eth_address(&actual_privkey);
-                return Ok(Some((actual_privkey, address)));
+                if crate::address::eth_address_matches_patterns(&address, prefix, suffix) {
+                    return Ok(Some((actual_privkey, address)));
+                }
             }
 
             total_keys += TOTAL_POINTS as u64;

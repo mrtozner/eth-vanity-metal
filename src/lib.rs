@@ -12,6 +12,7 @@ pub mod display;
 pub mod gpu;
 
 pub use address::{
+    eth_address_matches_patterns,
     generate_keypair,
     generate_keypair_direct,
     public_key_to_eth_address,

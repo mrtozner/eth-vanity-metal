@@ -1,20 +1,18 @@
 use clap::Parser;
-use std::time::Duration;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::io::Write;
-use eth_vanity_metal::{
-    VanityConfig, SequentialGenerator, public_key_to_eth_address, private_key_to_hex,
-    display_hardware_info, calculate_difficulty, format_difficulty,
-    is_gpu_available,
-};
-use eth_vanity_metal::gpu::{
-    initialize as gpu_initialize,
-};
+use eth_vanity_metal::gpu::initialize as gpu_initialize;
 use eth_vanity_metal::gpu::native_search::{
-    GpuNativeSearcher, generate_gpu_seeds, recover_private_key, parse_hex_pattern,
+    generate_gpu_seeds, parse_hex_pattern, recover_private_key, GpuNativeSearcher,
 };
 use eth_vanity_metal::gpu::profanity_batch::search_profanity_batch;
+use eth_vanity_metal::{
+    calculate_difficulty, display_hardware_info, eth_address_matches_patterns, format_difficulty,
+    is_gpu_available, private_key_to_hex, public_key_to_eth_address, SequentialGenerator,
+    VanityConfig,
+};
+use std::io::Write;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
 
 #[derive(Parser)]
 #[command(name = "eth-vanity-metal")]
@@ -132,7 +130,8 @@ fn main() {
     let r = running.clone();
     ctrlc::set_handler(move || {
         r.store(false, Ordering::SeqCst);
-    }).expect("Error setting Ctrl+C handler");
+    })
+    .expect("Error setting Ctrl+C handler");
 
     let attempts = Arc::new(AtomicU64::new(0));
     let start_time = std::time::Instant::now();
@@ -173,23 +172,19 @@ fn main() {
 
             std::thread::spawn(move || {
                 let mut gen = SequentialGenerator::new();
-                
+
                 while running.load(Ordering::Relaxed) {
                     let (secret, public) = gen.next();
                     let address = public_key_to_eth_address(public);
-                    
+
                     attempts.fetch_add(1, Ordering::Relaxed);
-                    
-                    // Check pattern match (skip "0x" prefix)
-                    let addr_lower = address[2..].to_lowercase();
-                    let matches = if let Some(ref p) = prefix {
-                        addr_lower.starts_with(&p.to_lowercase())
-                    } else if let Some(ref s) = suffix {
-                        addr_lower.ends_with(&s.to_lowercase())
-                    } else {
-                        false
-                    };
-                    
+
+                    let matches = eth_address_matches_patterns(
+                        &address,
+                        prefix.as_deref(),
+                        suffix.as_deref(),
+                    );
+
                     if matches {
                         running.store(false, Ordering::Relaxed);
                         return Some((address.clone(), private_key_to_hex(secret)));
@@ -203,7 +198,7 @@ fn main() {
     // Monitor progress
     while running.load(Ordering::Relaxed) {
         std::thread::sleep(Duration::from_millis(100));
-        
+
         let current_attempts = attempts.load(Ordering::Relaxed);
         let elapsed = start_time.elapsed();
         let rate = if elapsed.as_secs() > 0 {
@@ -211,8 +206,9 @@ fn main() {
         } else {
             0
         };
-        
-        print!("\r[Searching] Scanned: {} | Speed: {:.2}M keys/s | Time: {}s",
+
+        print!(
+            "\r[Searching] Scanned: {} | Speed: {:.2}M keys/s | Time: {}s",
             format_number(current_attempts),
             rate as f64 / 1_000_000.0,
             elapsed.as_secs()
@@ -239,13 +235,16 @@ fn validate_hex_pattern(pattern: &str) -> Result<(), String> {
     if pattern.is_empty() {
         return Err("Pattern cannot be empty".to_string());
     }
-    
+
     for ch in pattern.chars() {
         if !ch.is_ascii_hexdigit() {
-            return Err(format!("Invalid character '{}'. Use only hex characters (0-9, a-f, A-F)", ch));
+            return Err(format!(
+                "Invalid character '{}'. Use only hex characters (0-9, a-f, A-F)",
+                ch
+            ));
         }
     }
-    
+
     Ok(())
 }
 
@@ -310,7 +309,10 @@ fn run_benchmark(threads: usize) {
     println!("\n\nBenchmark Results:");
     println!("  Total keys:  {}", format_number(final_attempts));
     println!("  Avg speed:   {:.2}M keys/s", final_rate / 1_000_000.0);
-    println!("  Per thread:  {:.2}M keys/s", final_rate / threads as f64 / 1_000_000.0);
+    println!(
+        "  Per thread:  {:.2}M keys/s",
+        final_rate / threads as f64 / 1_000_000.0
+    );
 }
 
 /// Run GPU-native search (full EC math + Keccak on GPU)
@@ -327,22 +329,31 @@ fn run_gpu_native_search(
     std::io::stdout().flush().unwrap();
 
     // GPU configuration - maximum performance (matches Tron version)
-    let num_threads = 131072;   // Maximum threads
-    let steps_per_thread = 2048;  // Maximum steps per thread
+    let num_threads = 131072; // Maximum threads
+    let steps_per_thread = 2048; // Maximum steps per thread
 
-    // Determine search mode
-    let is_suffix = config.suffix.is_some();
-    let pattern_str = if is_suffix {
-        config.suffix.as_ref().unwrap()
-    } else {
-        config.prefix.as_ref().unwrap()
+    // GPU filters one pattern; longer one reduces wasted CPU rejects when both are set.
+    let (is_suffix, pattern_str) = match (&config.prefix, &config.suffix) {
+        (Some(p), None) => (false, p.as_str()),
+        (None, Some(s)) => (true, s.as_str()),
+        (Some(p), Some(s)) => {
+            if p.len() > s.len() {
+                (false, p.as_str())
+            } else {
+                (true, s.as_str())
+            }
+        }
+        (None, None) => unreachable!("validated before search"),
     };
 
     // Parse hex pattern to bytes
     println!("Step 2: Parsing hex pattern '{}'...", pattern_str);
     std::io::stdout().flush().unwrap();
     let pattern = parse_hex_pattern(pattern_str)?;
-    println!("Step 2: Pattern parsed successfully ({} bytes)", pattern.len());
+    println!(
+        "Step 2: Pattern parsed successfully ({} bytes)",
+        pattern.len()
+    );
     std::io::stdout().flush().unwrap();
 
     // Create GPU searcher
@@ -352,13 +363,31 @@ fn run_gpu_native_search(
     println!("Step 3: GPU searcher created successfully");
     std::io::stdout().flush().unwrap();
 
-    println!("GPU-Native Mode: {} threads × {} steps = {} keys/batch",
-        num_threads, steps_per_thread, (num_threads as u64) * (steps_per_thread as u64));
-    println!("Searching for {}: '{}' ({} bytes)",
+    println!(
+        "GPU-Native Mode: {} threads × {} steps = {} keys/batch",
+        num_threads,
+        steps_per_thread,
+        (num_threads as u64) * (steps_per_thread as u64)
+    );
+    print!(
+        "Searching for {}: '{}' ({} bytes)",
         if is_suffix { "suffix" } else { "prefix" },
         pattern_str,
         pattern.len()
     );
+    if config.prefix.is_some() && config.suffix.is_some() {
+        let other = if is_suffix {
+            config.prefix.as_deref().unwrap()
+        } else {
+            config.suffix.as_deref().unwrap()
+        };
+        print!(
+            "; also requiring {}: '{}'",
+            if is_suffix { "prefix" } else { "suffix" },
+            other
+        );
+    }
+    println!();
 
     let start_time = std::time::Instant::now();
     let mut found_count = 0u64;
@@ -369,30 +398,35 @@ fn run_gpu_native_search(
 
     while running.load(Ordering::SeqCst) {
         // Generate seeds for this batch (GPU-accelerated with precomp table)
-        let (points, privkeys, base_key) = generate_gpu_seeds(&searcher, num_threads, steps_per_thread as u64)?;
+        let (points, privkeys, base_key) =
+            generate_gpu_seeds(&searcher, num_threads, steps_per_thread as u64)?;
 
         // Run GPU search iteration
-        if let Some((thread_id, offset)) = searcher.search_iteration(
-            &points,
-            &privkeys,
-            &pattern,
-            is_suffix
-        )? {
+        if let Some((thread_id, offset)) =
+            searcher.search_iteration(&points, &privkeys, &pattern, is_suffix)?
+        {
             // Recover the private key
-            let found_key = recover_private_key(&base_key, thread_id, offset, steps_per_thread as u64)?;
+            let found_key =
+                recover_private_key(&base_key, thread_id, offset, steps_per_thread as u64)?;
 
             // Generate address
             let secp = secp256k1::Secp256k1::new();
             let pub_key = secp256k1::PublicKey::from_secret_key(&secp, &found_key);
             let address = public_key_to_eth_address(&pub_key);
-            let private_hex = private_key_to_hex(&found_key);
+            if eth_address_matches_patterns(
+                &address,
+                config.prefix.as_deref(),
+                config.suffix.as_deref(),
+            ) {
+                let private_hex = private_key_to_hex(&found_key);
 
-            found_count += 1;
-            println!("\n\n✓ Found vanity address!");
-            println!("========================");
-            println!("Address:      {}", address);
-            println!("Private Key:  {}", private_hex);
-            println!("\nWARNING: Keep your private key secure! Anyone with this key can access your funds.");
+                found_count += 1;
+                println!("\n\n✓ Found vanity address!");
+                println!("========================");
+                println!("Address:      {}", address);
+                println!("Private Key:  {}", private_hex);
+                println!("\nWARNING: Keep your private key secure! Anyone with this key can access your funds.");
+            }
         }
 
         batch_count += 1;
@@ -402,7 +436,8 @@ fn run_gpu_native_search(
         // Update progress
         let elapsed = start_time.elapsed();
         let rate = total_keys as f64 / elapsed.as_secs_f64();
-        print!("\r[GPU-Native] Found: {} | Scanned: {} | Speed: {:.2}M keys/s | Time: {}s   ",
+        print!(
+            "\r[GPU-Native] Found: {} | Scanned: {} | Speed: {:.2}M keys/s | Time: {}s   ",
             found_count,
             format_number(total_keys),
             rate / 1_000_000.0,
@@ -427,35 +462,63 @@ fn run_gpu_profanity_search(
     let context = gpu_initialize()?;
     println!("GPU: {}", context.device_name());
 
-    // Determine search mode
-    let is_suffix = config.suffix.is_some();
-    let pattern_str = if is_suffix {
-        config.suffix.as_ref().unwrap()
-    } else {
-        config.prefix.as_ref().unwrap()
+    let (is_suffix, pattern_str) = match (&config.prefix, &config.suffix) {
+        (Some(p), None) => (false, p.as_str()),
+        (None, Some(s)) => (true, s.as_str()),
+        (Some(p), Some(s)) => {
+            if p.len() > s.len() {
+                (false, p.as_str())
+            } else {
+                (true, s.as_str())
+            }
+        }
+        (None, None) => unreachable!("validated before search"),
     };
 
     // Parse hex pattern to bytes
     let pattern = parse_hex_pattern(pattern_str)?;
-    println!("Pattern: '{}' ({} bytes, {})",
+    print!(
+        "Pattern: '{}' ({} bytes, {})",
         pattern_str,
         pattern.len(),
         if is_suffix { "suffix" } else { "prefix" }
     );
+    if config.prefix.is_some() && config.suffix.is_some() {
+        let other = if is_suffix {
+            config.prefix.as_deref().unwrap()
+        } else {
+            config.suffix.as_deref().unwrap()
+        };
+        print!(
+            "; also requiring {}: '{}'",
+            if is_suffix { "prefix" } else { "suffix" },
+            other
+        );
+    }
+    println!();
 
     // Run the profanity batch search
     let stop_signal = running.clone();
 
     // Progress callback
     let progress_callback = |total: u64, rate: f64| {
-        print!("\r[GPU-Profanity] Scanned: {} | Speed: {:.2}M keys/s   ",
+        print!(
+            "\r[GPU-Profanity] Scanned: {} | Speed: {:.2}M keys/s   ",
             format_number(total),
             rate
         );
         std::io::stdout().flush().unwrap();
     };
 
-    match search_profanity_batch(&context, &pattern, is_suffix, stop_signal, progress_callback) {
+    match search_profanity_batch(
+        &context,
+        &pattern,
+        is_suffix,
+        config.prefix.as_deref(),
+        config.suffix.as_deref(),
+        stop_signal,
+        progress_callback,
+    ) {
         Ok(Some((privkey, address))) => {
             println!("\n\n✓ Found vanity address!");
             println!("========================");

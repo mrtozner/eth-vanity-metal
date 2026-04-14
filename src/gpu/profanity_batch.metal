@@ -560,13 +560,37 @@ kernel void debug_keccak_test(
 // 10. Pattern Matching Kernel
 // ==========================================
 
+// Reusable switch-case checker at any offset (for pattern matching)
+inline bool check_at_offset(thread const uchar* hash,
+                             constant const uchar* pat,
+                             uint len, uint offset) {
+    switch (len) {
+        case 0: return true;
+        case 1: return hash[offset] == pat[0];
+        case 2: return hash[offset] == pat[0] && hash[offset+1] == pat[1];
+        case 3: return hash[offset] == pat[0] && hash[offset+1] == pat[1] && hash[offset+2] == pat[2];
+        case 4: return hash[offset] == pat[0] && hash[offset+1] == pat[1] && hash[offset+2] == pat[2] && hash[offset+3] == pat[3];
+        case 5: return hash[offset] == pat[0] && hash[offset+1] == pat[1] && hash[offset+2] == pat[2] && hash[offset+3] == pat[3] && hash[offset+4] == pat[4];
+        case 6: return hash[offset] == pat[0] && hash[offset+1] == pat[1] && hash[offset+2] == pat[2] && hash[offset+3] == pat[3] && hash[offset+4] == pat[4] && hash[offset+5] == pat[5];
+        case 7: return hash[offset] == pat[0] && hash[offset+1] == pat[1] && hash[offset+2] == pat[2] && hash[offset+3] == pat[3] && hash[offset+4] == pat[4] && hash[offset+5] == pat[5] && hash[offset+6] == pat[6];
+        case 8: return hash[offset] == pat[0] && hash[offset+1] == pat[1] && hash[offset+2] == pat[2] && hash[offset+3] == pat[3] && hash[offset+4] == pat[4] && hash[offset+5] == pat[5] && hash[offset+6] == pat[6] && hash[offset+7] == pat[7];
+        case 9: return hash[offset] == pat[0] && hash[offset+1] == pat[1] && hash[offset+2] == pat[2] && hash[offset+3] == pat[3] && hash[offset+4] == pat[4] && hash[offset+5] == pat[5] && hash[offset+6] == pat[6] && hash[offset+7] == pat[7] && hash[offset+8] == pat[8];
+        case 10: return hash[offset] == pat[0] && hash[offset+1] == pat[1] && hash[offset+2] == pat[2] && hash[offset+3] == pat[3] && hash[offset+4] == pat[4] && hash[offset+5] == pat[5] && hash[offset+6] == pat[6] && hash[offset+7] == pat[7] && hash[offset+8] == pat[8] && hash[offset+9] == pat[9];
+        default:
+            for (uint i = 0; i < len && i < 20; i++) {
+                if (hash[offset + i] != pat[i]) return false;
+            }
+            return true;
+    }
+}
+
 kernel void profanity_score_matching(
     device const uint* pAddressHash     [[ buffer(0) ]],
     device atomic_uint* pFoundFlag      [[ buffer(1) ]],
     device uint* pFoundId               [[ buffer(2) ]],
-    constant uchar* pattern             [[ buffer(3) ]],
-    constant uint& pattern_len          [[ buffer(4) ]],
-    constant uint& is_suffix            [[ buffer(5) ]],
+    constant uchar* pattern             [[ buffer(3) ]],  // [prefix|suffix] concatenated
+    constant uint& prefix_len           [[ buffer(4) ]],  // was pattern_len
+    constant uint& suffix_len           [[ buffer(5) ]],  // was is_suffix
     uint gid [[ thread_position_in_grid ]])
 {
     // Early exit if already found
@@ -605,26 +629,14 @@ kernel void profanity_score_matching(
     hash[18] = (h4 >> 8) & 0xFF;
     hash[19] = h4 & 0xFF;
 
-    // Check pattern
+    // Dual pattern matching: check prefix at start, suffix at end
     bool match = true;
-    if (is_suffix != 0) {
-        // Suffix: check last pattern_len bytes
-        uint start = 20 - pattern_len;
-        for (uint i = 0; i < pattern_len; i++) {
-            if (hash[start + i] != pattern[i]) {
-                match = false;
-                break;
-            }
-        }
-    } else {
-        // Prefix: check first pattern_len bytes
-        for (uint i = 0; i < pattern_len; i++) {
-            if (hash[i] != pattern[i]) {
-                match = false;
-                break;
-            }
-        }
-    }
+    if (prefix_len > 0 && !check_at_offset(hash, pattern, prefix_len, 0))
+        match = false;
+    if (match && suffix_len > 0 && !check_at_offset(hash, pattern + prefix_len, suffix_len, 20 - suffix_len))
+        match = false;
+    if (prefix_len == 0 && suffix_len == 0)
+        match = false;
 
     if (match) {
         uint expected = 0;

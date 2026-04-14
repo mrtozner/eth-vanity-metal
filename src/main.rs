@@ -103,12 +103,11 @@ fn main() {
     };
 
     // Display configuration
-    let pattern_desc = if let Some(ref p) = config.prefix {
-        format!("0x{}...", p)
-    } else if let Some(ref s) = config.suffix {
-        format!("0x...{}", s)
-    } else {
-        "unknown".to_string()
+    let pattern_desc = match (&config.prefix, &config.suffix) {
+        (Some(p), Some(s)) => format!("0x{}...{}", p, s),
+        (Some(p), None) => format!("0x{}...", p),
+        (None, Some(s)) => format!("0x...{}", s),
+        (None, None) => "unknown".to_string(),
     };
 
     println!("\nSearching for addresses like: {}", pattern_desc);
@@ -330,19 +329,28 @@ fn run_gpu_native_search(
     let num_threads = 131072;   // Maximum threads
     let steps_per_thread = 2048;  // Maximum steps per thread
 
-    // Determine search mode
-    let is_suffix = config.suffix.is_some();
-    let pattern_str = if is_suffix {
-        config.suffix.as_ref().unwrap()
-    } else {
-        config.prefix.as_ref().unwrap()
-    };
+    // Parse both patterns independently
+    let prefix_bytes = config.prefix.as_deref()
+        .map(|p| parse_hex_pattern(p))
+        .transpose()?
+        .unwrap_or_default();
+    let suffix_bytes = config.suffix.as_deref()
+        .map(|s| parse_hex_pattern(s))
+        .transpose()?
+        .unwrap_or_default();
 
-    // Parse hex pattern to bytes
-    println!("Step 2: Parsing hex pattern '{}'...", pattern_str);
-    std::io::stdout().flush().unwrap();
-    let pattern = parse_hex_pattern(pattern_str)?;
-    println!("Step 2: Pattern parsed successfully ({} bytes)", pattern.len());
+    // Validate combined length
+    if prefix_bytes.len() + suffix_bytes.len() > 20 {
+        return Err("Combined prefix + suffix cannot exceed 20 hex bytes (40 chars)".into());
+    }
+
+    // Warn about overlapping patterns
+    if prefix_bytes.len() + suffix_bytes.len() > 20 {
+        eprintln!("Warning: Prefix + suffix overlap in address space. Contradicting bytes will never match.");
+    }
+
+    println!("Step 2: Patterns parsed - prefix: {} bytes, suffix: {} bytes",
+        prefix_bytes.len(), suffix_bytes.len());
     std::io::stdout().flush().unwrap();
 
     // Create GPU searcher
@@ -354,11 +362,12 @@ fn run_gpu_native_search(
 
     println!("GPU-Native Mode: {} threads × {} steps = {} keys/batch",
         num_threads, steps_per_thread, (num_threads as u64) * (steps_per_thread as u64));
-    println!("Searching for {}: '{}' ({} bytes)",
-        if is_suffix { "suffix" } else { "prefix" },
-        pattern_str,
-        pattern.len()
-    );
+    if !prefix_bytes.is_empty() {
+        println!("Prefix: '{}' ({} bytes)", config.prefix.as_deref().unwrap_or(""), prefix_bytes.len());
+    }
+    if !suffix_bytes.is_empty() {
+        println!("Suffix: '{}' ({} bytes)", config.suffix.as_deref().unwrap_or(""), suffix_bytes.len());
+    }
 
     let start_time = std::time::Instant::now();
     let mut found_count = 0u64;
@@ -375,8 +384,8 @@ fn run_gpu_native_search(
         if let Some((thread_id, offset)) = searcher.search_iteration(
             &points,
             &privkeys,
-            &pattern,
-            is_suffix
+            &prefix_bytes,
+            &suffix_bytes,
         )? {
             // Recover the private key
             let found_key = recover_private_key(&base_key, thread_id, offset, steps_per_thread as u64)?;
@@ -387,24 +396,33 @@ fn run_gpu_native_search(
             let address = public_key_to_eth_address(&pub_key);
             let private_hex = private_key_to_hex(&found_key);
 
-            // Check if this is a GLV match
-            let is_glv = (offset & 0x80000000) != 0;
-
-            // Verify the address actually matches the pattern on CPU
-            let addr_hex = &address[2..].to_lowercase();
-            let pattern_lower = pattern_str.to_lowercase();
-            let verified = if is_suffix {
-                addr_hex.ends_with(&pattern_lower)
-            } else {
-                addr_hex.starts_with(&pattern_lower)
+            // Decode endomorphism variant from top 3 bits
+            let variant = offset >> 29;
+            let variant_label = match variant {
+                0 => "",
+                1 => " (via GLV λ)",
+                2 => " (via GLV λ²)",
+                3 => " (via negation)",
+                4 => " (via GLV λ + neg)",
+                5 => " (via GLV λ² + neg)",
+                _ => " (unknown variant)",
             };
 
-            if !verified {
+            // Verify the address actually matches both patterns on CPU
+            let addr_hex = &address[2..].to_lowercase();
+            let prefix_ok = config.prefix.as_ref()
+                .map(|p| addr_hex.starts_with(&p.to_lowercase()))
+                .unwrap_or(true);
+            let suffix_ok = config.suffix.as_ref()
+                .map(|s| addr_hex.ends_with(&s.to_lowercase()))
+                .unwrap_or(true);
+
+            if !prefix_ok || !suffix_ok {
                 continue;
             }
 
             found_count += 1;
-            println!("\n\n✓ Found vanity address!{}", if is_glv { " (via GLV endomorphism)" } else { "" });
+            println!("\n\n✓ Found vanity address!{}", variant_label);
             println!("========================");
             println!("Address:      {}", address);
             println!("Private Key:  {}", private_hex);
@@ -412,14 +430,14 @@ fn run_gpu_native_search(
         }
 
         batch_count += 1;
-        // Each EC point yields 2 address checks (original + GLV endomorphism)
-        let total_keys = batch_count * (num_threads as u64) * (steps_per_thread as u64) * 2;
+        // Each EC point yields 6 address checks (original + 2 GLV + 3 negations)
+        let total_keys = batch_count * (num_threads as u64) * (steps_per_thread as u64) * 6;
         attempts.store(total_keys, Ordering::Relaxed);
 
         // Update progress
         let elapsed = start_time.elapsed();
         let rate = total_keys as f64 / elapsed.as_secs_f64();
-        print!("\r[GPU-Native+GLV] Found: {} | Scanned: {} | Speed: {:.2}M addr/s | Time: {}s   ",
+        print!("\r[GPU-Native+6way] Found: {} | Scanned: {} | Speed: {:.2}M addr/s | Time: {}s   ",
             found_count,
             format_number(total_keys),
             rate / 1_000_000.0,
@@ -444,21 +462,23 @@ fn run_gpu_profanity_search(
     let context = gpu_initialize()?;
     println!("GPU: {}", context.device_name());
 
-    // Determine search mode
-    let is_suffix = config.suffix.is_some();
-    let pattern_str = if is_suffix {
-        config.suffix.as_ref().unwrap()
-    } else {
-        config.prefix.as_ref().unwrap()
-    };
+    // Parse both patterns independently
+    let prefix_bytes = config.prefix.as_deref()
+        .map(|p| parse_hex_pattern(p))
+        .transpose()?
+        .unwrap_or_default();
+    let suffix_bytes = config.suffix.as_deref()
+        .map(|s| parse_hex_pattern(s))
+        .transpose()?
+        .unwrap_or_default();
 
-    // Parse hex pattern to bytes
-    let pattern = parse_hex_pattern(pattern_str)?;
-    println!("Pattern: '{}' ({} bytes, {})",
-        pattern_str,
-        pattern.len(),
-        if is_suffix { "suffix" } else { "prefix" }
-    );
+    // Validate combined length
+    if prefix_bytes.len() + suffix_bytes.len() > 20 {
+        return Err("Combined prefix + suffix cannot exceed 20 hex bytes (40 chars)".into());
+    }
+
+    println!("Patterns: prefix={} bytes, suffix={} bytes",
+        prefix_bytes.len(), suffix_bytes.len());
 
     // Run the profanity batch search
     let stop_signal = running.clone();
@@ -472,7 +492,7 @@ fn run_gpu_profanity_search(
         std::io::stdout().flush().unwrap();
     };
 
-    match search_profanity_batch(&context, &pattern, is_suffix, stop_signal, progress_callback) {
+    match search_profanity_batch(&context, &prefix_bytes, &suffix_bytes, stop_signal, progress_callback) {
         Ok(Some((privkey, address))) => {
             println!("\n\n✓ Found vanity address!");
             println!("========================");

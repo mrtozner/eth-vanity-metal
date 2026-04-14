@@ -59,6 +59,13 @@ constant uint256_t BETA = {
      0x6E64479EAC3434E9ULL, 0x7AE96A2B657C0710ULL}
 };
 
+// beta^2 (beta squared): second cube root of unity mod p
+// beta^2 = beta * beta mod p, where beta^3 = 1 (mod p)
+constant uint256_t BETA_SQ = {
+    {0x3EC693D68E6AFA40ULL, 0x630FB68AED0A766AULL,
+     0x919BB86153CBCB16ULL, 0x851695D49A83F8EFULL}
+};
+
 // Add two 256-bit numbers with carry
 inline uint add_with_carry(thread uint256_t& r, thread const uint256_t& a, thread const uint256_t& b) {
     ulong carry = 0;
@@ -1397,91 +1404,40 @@ inline void uint256_to_bytes(thread const uint256_t& num, thread uchar* bytes) {
 // 10. ETH Pattern Matching (Hex)
 // ==========================================
 
-// FAST pattern matching using switch-case to eliminate runtime conditionals
-// Creates completely separate code paths per pattern length
-// Eliminates GPU thread divergence that causes slowdowns
-// Supports up to 10 bytes (20 hex chars)
-inline bool check_pattern_fast(thread const uchar* hash,
-                               thread const uchar* pattern_cache,
-                               uint pattern_len,
-                               bool is_suffix) {
-    uint offset = is_suffix ? (32 - pattern_len) : 12;
-
-    // Use switch to create completely separate code paths
-    // This eliminates ALL runtime conditionals in the comparison
-    switch (pattern_len) {
-        case 1:
-            return hash[offset] == pattern_cache[0];
-        case 2:
-            return hash[offset] == pattern_cache[0] &&
-                   hash[offset + 1] == pattern_cache[1];
-        case 3:
-            return hash[offset] == pattern_cache[0] &&
-                   hash[offset + 1] == pattern_cache[1] &&
-                   hash[offset + 2] == pattern_cache[2];
-        case 4:
-            return hash[offset] == pattern_cache[0] &&
-                   hash[offset + 1] == pattern_cache[1] &&
-                   hash[offset + 2] == pattern_cache[2] &&
-                   hash[offset + 3] == pattern_cache[3];
-        case 5:
-            return hash[offset] == pattern_cache[0] &&
-                   hash[offset + 1] == pattern_cache[1] &&
-                   hash[offset + 2] == pattern_cache[2] &&
-                   hash[offset + 3] == pattern_cache[3] &&
-                   hash[offset + 4] == pattern_cache[4];
-        case 6:
-            return hash[offset] == pattern_cache[0] &&
-                   hash[offset + 1] == pattern_cache[1] &&
-                   hash[offset + 2] == pattern_cache[2] &&
-                   hash[offset + 3] == pattern_cache[3] &&
-                   hash[offset + 4] == pattern_cache[4] &&
-                   hash[offset + 5] == pattern_cache[5];
-        case 7:
-            return hash[offset] == pattern_cache[0] &&
-                   hash[offset + 1] == pattern_cache[1] &&
-                   hash[offset + 2] == pattern_cache[2] &&
-                   hash[offset + 3] == pattern_cache[3] &&
-                   hash[offset + 4] == pattern_cache[4] &&
-                   hash[offset + 5] == pattern_cache[5] &&
-                   hash[offset + 6] == pattern_cache[6];
-        case 8:
-            return hash[offset] == pattern_cache[0] &&
-                   hash[offset + 1] == pattern_cache[1] &&
-                   hash[offset + 2] == pattern_cache[2] &&
-                   hash[offset + 3] == pattern_cache[3] &&
-                   hash[offset + 4] == pattern_cache[4] &&
-                   hash[offset + 5] == pattern_cache[5] &&
-                   hash[offset + 6] == pattern_cache[6] &&
-                   hash[offset + 7] == pattern_cache[7];
-        case 9:
-            return hash[offset] == pattern_cache[0] &&
-                   hash[offset + 1] == pattern_cache[1] &&
-                   hash[offset + 2] == pattern_cache[2] &&
-                   hash[offset + 3] == pattern_cache[3] &&
-                   hash[offset + 4] == pattern_cache[4] &&
-                   hash[offset + 5] == pattern_cache[5] &&
-                   hash[offset + 6] == pattern_cache[6] &&
-                   hash[offset + 7] == pattern_cache[7] &&
-                   hash[offset + 8] == pattern_cache[8];
-        case 10:
-            return hash[offset] == pattern_cache[0] &&
-                   hash[offset + 1] == pattern_cache[1] &&
-                   hash[offset + 2] == pattern_cache[2] &&
-                   hash[offset + 3] == pattern_cache[3] &&
-                   hash[offset + 4] == pattern_cache[4] &&
-                   hash[offset + 5] == pattern_cache[5] &&
-                   hash[offset + 6] == pattern_cache[6] &&
-                   hash[offset + 7] == pattern_cache[7] &&
-                   hash[offset + 8] == pattern_cache[8] &&
-                   hash[offset + 9] == pattern_cache[9];
+// Reusable switch-case checker at any offset
+inline bool check_at_offset(thread const uchar* hash,
+                             thread const uchar* pat,
+                             uint len, uint offset) {
+    switch (len) {
+        case 0: return true;
+        case 1: return hash[offset] == pat[0];
+        case 2: return hash[offset] == pat[0] && hash[offset+1] == pat[1];
+        case 3: return hash[offset] == pat[0] && hash[offset+1] == pat[1] && hash[offset+2] == pat[2];
+        case 4: return hash[offset] == pat[0] && hash[offset+1] == pat[1] && hash[offset+2] == pat[2] && hash[offset+3] == pat[3];
+        case 5: return hash[offset] == pat[0] && hash[offset+1] == pat[1] && hash[offset+2] == pat[2] && hash[offset+3] == pat[3] && hash[offset+4] == pat[4];
+        case 6: return hash[offset] == pat[0] && hash[offset+1] == pat[1] && hash[offset+2] == pat[2] && hash[offset+3] == pat[3] && hash[offset+4] == pat[4] && hash[offset+5] == pat[5];
+        case 7: return hash[offset] == pat[0] && hash[offset+1] == pat[1] && hash[offset+2] == pat[2] && hash[offset+3] == pat[3] && hash[offset+4] == pat[4] && hash[offset+5] == pat[5] && hash[offset+6] == pat[6];
+        case 8: return hash[offset] == pat[0] && hash[offset+1] == pat[1] && hash[offset+2] == pat[2] && hash[offset+3] == pat[3] && hash[offset+4] == pat[4] && hash[offset+5] == pat[5] && hash[offset+6] == pat[6] && hash[offset+7] == pat[7];
+        case 9: return hash[offset] == pat[0] && hash[offset+1] == pat[1] && hash[offset+2] == pat[2] && hash[offset+3] == pat[3] && hash[offset+4] == pat[4] && hash[offset+5] == pat[5] && hash[offset+6] == pat[6] && hash[offset+7] == pat[7] && hash[offset+8] == pat[8];
+        case 10: return hash[offset] == pat[0] && hash[offset+1] == pat[1] && hash[offset+2] == pat[2] && hash[offset+3] == pat[3] && hash[offset+4] == pat[4] && hash[offset+5] == pat[5] && hash[offset+6] == pat[6] && hash[offset+7] == pat[7] && hash[offset+8] == pat[8] && hash[offset+9] == pat[9];
         default:
-            // Fallback for longer patterns (rare)
-            for (uint i = 0; i < pattern_len && i < 20; i++) {
-                if (hash[offset + i] != pattern_cache[i]) return false;
+            for (uint i = 0; i < len && i < 20; i++) {
+                if (hash[offset + i] != pat[i]) return false;
             }
             return true;
     }
+}
+
+// Dual-pattern check: prefix at hash[12], suffix at hash[32-suffix_len]
+inline bool check_pattern_dual(thread const uchar* hash,
+                                thread const uchar* pattern_cache,
+                                uint prefix_len, uint suffix_len) {
+    if (prefix_len > 0 && !check_at_offset(hash, pattern_cache, prefix_len, 12))
+        return false;
+    if (suffix_len > 0 && !check_at_offset(hash, pattern_cache + prefix_len,
+                                             suffix_len, 32 - suffix_len))
+        return false;
+    return (prefix_len > 0 || suffix_len > 0);
 }
 
 // Check hex pattern match for ETH address (LEGACY - kept for reference)
@@ -1546,9 +1502,9 @@ kernel void generate_seeds(
 kernel void eth_vanity_search(
     device const JacobianPoint* start_points  [[ buffer(0) ]],
     device const uint256_t* start_privkeys    [[ buffer(1) ]],
-    constant uchar* pattern                   [[ buffer(2) ]],
-    constant uint& pattern_len                [[ buffer(3) ]],
-    constant uint& is_suffix                  [[ buffer(4) ]],
+    constant uchar* pattern                   [[ buffer(2) ]],  // [prefix|suffix] concatenated
+    constant uint& prefix_len                 [[ buffer(3) ]],  // was pattern_len
+    constant uint& suffix_len                 [[ buffer(4) ]],  // was is_suffix
     device atomic_uint* found_flag            [[ buffer(5) ]],
     device uint* result_thread_id             [[ buffer(6) ]],
     device uint* result_offset                [[ buffer(7) ]],
@@ -1562,7 +1518,8 @@ kernel void eth_vanity_search(
 
     // Cache pattern in registers
     uchar pattern_cache[20];
-    for (uint k = 0; k < pattern_len && k < 20; k++) {
+    uint total_pattern_len = min(prefix_len + suffix_len, 20u);
+    for (uint k = 0; k < total_pattern_len; k++) {
         pattern_cache[k] = pattern[k];
     }
 
@@ -1572,6 +1529,10 @@ kernel void eth_vanity_search(
     // Initial: convert Jacobian starting point to affine (one-time cost)
     uint256_t aff_px, aff_py;
     jacobian_to_affine_inplace(aff_px, aff_py, P);
+
+    // Thread-local copy of P for mod_sub (constant address space cannot be passed as thread ref)
+    uint256_t p_local;
+    for (int i = 0; i < 4; i++) p_local.d[i] = SECP256K1_P.d[i];
 
     for (uint batch = 0; batch < num_batches; batch++) {
         // Check found flag periodically
@@ -1591,7 +1552,7 @@ kernel void eth_vanity_search(
         // --- PHASE 2: BATCH INVERSE ALL 16 DENOMINATORS ---
         batch_inverse_16(diffs);
 
-        // --- PHASE 3: COMPLETE AFFINE ADDITIONS + ADDRESS CHECKS ---
+        // --- PHASE 3: COMPLETE AFFINE ADDITIONS + 6-WAY ADDRESS CHECKS ---
         uint256_t next_px, next_py;
         for (int k = 0; k < 16; k++) {
             // Read stride table entry to thread-local
@@ -1625,37 +1586,109 @@ kernel void eth_vanity_search(
                 next_py = y3;
             }
 
-            // --- CHECK 1: Original Point ---
+            // Precompute derived coordinates for 6-way check
+            uint256_t glv_x;      // beta * x3
+            mul_mod_const2(glv_x, x3, BETA);
+
+            uint256_t glv2_x;     // beta^2 * x3
+            mul_mod_const2(glv2_x, x3, BETA_SQ);
+
+            uint256_t neg_y;      // p - y3
+            mod_sub(neg_y, p_local, y3);
+
+            uint real_offset = (batch * 16) + k + 1;
+
+            // --- CHECK 1: Original (x3, y3) --- variant 0
             {
                 uchar hash[32];
                 keccak_256_from_uint256(x3, y3, hash);
-                bool match = check_pattern_fast(hash, pattern_cache, pattern_len, is_suffix != 0);
-                if (match) {
+                if (check_pattern_dual(hash, pattern_cache, prefix_len, suffix_len)) {
                     uint expected = 0;
                     if (atomic_compare_exchange_weak_explicit(
                             found_flag, &expected, 1,
                             memory_order_relaxed, memory_order_relaxed)) {
                         *result_thread_id = gid;
-                        *result_offset = (batch * 16) + k + 1;
+                        *result_offset = real_offset;
                     }
                     return;
                 }
             }
 
-            // --- CHECK 2: GLV Endomorphism ---
+            // --- CHECK 2: GLV beta (beta*x3, y3) --- variant 1
             {
-                uint256_t glv_x;
-                mul_mod_const2(glv_x, x3, BETA);
-                uchar hash2[32];
-                keccak_256_from_uint256(glv_x, y3, hash2);
-                bool match2 = check_pattern_fast(hash2, pattern_cache, pattern_len, is_suffix != 0);
-                if (match2) {
+                uchar hash[32];
+                keccak_256_from_uint256(glv_x, y3, hash);
+                if (check_pattern_dual(hash, pattern_cache, prefix_len, suffix_len)) {
                     uint expected = 0;
                     if (atomic_compare_exchange_weak_explicit(
                             found_flag, &expected, 1,
                             memory_order_relaxed, memory_order_relaxed)) {
                         *result_thread_id = gid;
-                        *result_offset = ((batch * 16) + k + 1) | 0x80000000u;
+                        *result_offset = real_offset | (1u << 29);
+                    }
+                    return;
+                }
+            }
+
+            // --- CHECK 3: GLV beta^2 (beta^2*x3, y3) --- variant 2
+            {
+                uchar hash[32];
+                keccak_256_from_uint256(glv2_x, y3, hash);
+                if (check_pattern_dual(hash, pattern_cache, prefix_len, suffix_len)) {
+                    uint expected = 0;
+                    if (atomic_compare_exchange_weak_explicit(
+                            found_flag, &expected, 1,
+                            memory_order_relaxed, memory_order_relaxed)) {
+                        *result_thread_id = gid;
+                        *result_offset = real_offset | (2u << 29);
+                    }
+                    return;
+                }
+            }
+
+            // --- CHECK 4: Negation (x3, neg_y) --- variant 3
+            {
+                uchar hash[32];
+                keccak_256_from_uint256(x3, neg_y, hash);
+                if (check_pattern_dual(hash, pattern_cache, prefix_len, suffix_len)) {
+                    uint expected = 0;
+                    if (atomic_compare_exchange_weak_explicit(
+                            found_flag, &expected, 1,
+                            memory_order_relaxed, memory_order_relaxed)) {
+                        *result_thread_id = gid;
+                        *result_offset = real_offset | (3u << 29);
+                    }
+                    return;
+                }
+            }
+
+            // --- CHECK 5: GLV beta + neg (beta*x3, neg_y) --- variant 4
+            {
+                uchar hash[32];
+                keccak_256_from_uint256(glv_x, neg_y, hash);
+                if (check_pattern_dual(hash, pattern_cache, prefix_len, suffix_len)) {
+                    uint expected = 0;
+                    if (atomic_compare_exchange_weak_explicit(
+                            found_flag, &expected, 1,
+                            memory_order_relaxed, memory_order_relaxed)) {
+                        *result_thread_id = gid;
+                        *result_offset = real_offset | (4u << 29);
+                    }
+                    return;
+                }
+            }
+
+            // --- CHECK 6: GLV beta^2 + neg (beta^2*x3, neg_y) --- variant 5
+            {
+                uchar hash[32];
+                keccak_256_from_uint256(glv2_x, neg_y, hash);
+                if (check_pattern_dual(hash, pattern_cache, prefix_len, suffix_len)) {
+                    uint expected = 0;
+                    if (atomic_compare_exchange_weak_explicit(
+                            found_flag, &expected, 1,
+                            memory_order_relaxed, memory_order_relaxed)) {
+                        *result_thread_id = gid;
+                        *result_offset = real_offset | (5u << 29);
                     }
                     return;
                 }

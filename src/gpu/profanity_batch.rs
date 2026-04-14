@@ -40,13 +40,13 @@ pub struct ProfanityBatchSearcher {
     private_keys: Vec<[u8; 32]>,
 
     // Configuration
-    pattern: Vec<u8>,
-    is_suffix: bool,
+    prefix_pattern: Vec<u8>,
+    suffix_pattern: Vec<u8>,
 }
 
 impl ProfanityBatchSearcher {
     /// Create a new profanity-style batch searcher
-    pub fn new(ctx: &MetalContext, pattern: &[u8], is_suffix: bool) -> Result<Self, GpuError> {
+    pub fn new(ctx: &MetalContext, prefix_pattern: &[u8], suffix_pattern: &[u8]) -> Result<Self, GpuError> {
         let device = ctx.device.clone();
         let command_queue = ctx.command_queue.clone();
 
@@ -103,8 +103,13 @@ impl ProfanityBatchSearcher {
         let found_flag_buffer = device.new_buffer(4, MTLResourceOptions::StorageModeShared);
         let found_id_buffer = device.new_buffer(4, MTLResourceOptions::StorageModeShared);
 
+        // Concatenate prefix + suffix patterns
+        let mut combined = Vec::with_capacity(prefix_pattern.len() + suffix_pattern.len());
+        combined.extend_from_slice(prefix_pattern);
+        combined.extend_from_slice(suffix_pattern);
+
         let pattern_buffer = device.new_buffer(
-            std::cmp::max(pattern.len(), 1) as u64,
+            std::cmp::max(combined.len(), 1) as u64,
             MTLResourceOptions::StorageModeShared,
         );
         let pattern_len_buffer = device.new_buffer(4, MTLResourceOptions::StorageModeShared);
@@ -112,14 +117,16 @@ impl ProfanityBatchSearcher {
 
         // Initialize pattern buffers
         unsafe {
-            let ptr = pattern_buffer.contents() as *mut u8;
-            std::ptr::copy_nonoverlapping(pattern.as_ptr(), ptr, pattern.len());
+            if !combined.is_empty() {
+                let ptr = pattern_buffer.contents() as *mut u8;
+                std::ptr::copy_nonoverlapping(combined.as_ptr(), ptr, combined.len());
+            }
 
             let len_ptr = pattern_len_buffer.contents() as *mut u32;
-            *len_ptr = pattern.len() as u32;
+            *len_ptr = prefix_pattern.len() as u32;  // prefix_len
 
             let suffix_ptr = is_suffix_buffer.contents() as *mut u32;
-            *suffix_ptr = if is_suffix { 1 } else { 0 };
+            *suffix_ptr = suffix_pattern.len() as u32;  // suffix_len
         }
 
         Ok(Self {
@@ -138,8 +145,8 @@ impl ProfanityBatchSearcher {
             pattern_len_buffer,
             is_suffix_buffer,
             private_keys: Vec::with_capacity(TOTAL_POINTS),
-            pattern: pattern.to_vec(),
-            is_suffix,
+            prefix_pattern: prefix_pattern.to_vec(),
+            suffix_pattern: suffix_pattern.to_vec(),
         })
     }
 
@@ -695,8 +702,8 @@ pub fn debug_test_keccak(ctx: &MetalContext) -> Result<(), GpuError> {
 /// Main search function with progress reporting
 pub fn search_profanity_batch(
     ctx: &MetalContext,
-    pattern: &[u8],
-    is_suffix: bool,
+    prefix_pattern: &[u8],
+    suffix_pattern: &[u8],
     stop_signal: Arc<AtomicBool>,
     progress_callback: impl Fn(u64, f64),
 ) -> Result<Option<([u8; 32], String)>, GpuError> {
@@ -708,7 +715,7 @@ pub fn search_profanity_batch(
     // Debug: test Keccak implementation
     // debug_test_keccak(ctx)?;
 
-    let mut searcher = ProfanityBatchSearcher::new(ctx, pattern, is_suffix)?;
+    let mut searcher = ProfanityBatchSearcher::new(ctx, prefix_pattern, suffix_pattern)?;
 
     let start_time = std::time::Instant::now();
     let mut total_keys: u64 = 0;

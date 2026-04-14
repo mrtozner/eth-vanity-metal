@@ -16,6 +16,15 @@ const GLV_LAMBDA: [u8; 32] = [
     0xDF, 0x02, 0x96, 0x7C, 0x1B, 0x23, 0xBD, 0x72,
 ];
 
+/// GLV endomorphism eigenvalue λ² mod n for secp256k1
+/// λ² = 0xAC9C52B33FA3CF1F5AD9E3FD77ED9BA4A880B9FC8EC739C2E0CFC810B51283CE
+const GLV_LAMBDA_SQ: [u8; 32] = [
+    0xAC, 0x9C, 0x52, 0xB3, 0x3F, 0xA3, 0xCF, 0x1F,
+    0x5A, 0xD9, 0xE3, 0xFD, 0x77, 0xED, 0x9B, 0xA4,
+    0xA8, 0x80, 0xB9, 0xFC, 0x8E, 0xC7, 0x39, 0xC2,
+    0xE0, 0xCF, 0xC8, 0x10, 0xB5, 0x12, 0x83, 0xCE,
+];
+
 // ==========================================
 // GPU-Compatible Structs
 // ==========================================
@@ -342,8 +351,8 @@ impl GpuNativeSearcher {
         &self,
         points: &[GpuJacobianPoint],
         privkeys: &[GpuUint256],
-        pattern: &[u8],
-        is_suffix: bool,
+        prefix_pattern: &[u8],
+        suffix_pattern: &[u8],
     ) -> Result<Option<(u32, u32)>, GpuError> {
         let device = self.context.device();
 
@@ -360,22 +369,27 @@ impl GpuNativeSearcher {
             metal::MTLResourceOptions::StorageModeShared,
         );
 
+        // Concatenate prefix + suffix patterns
+        let mut combined = Vec::with_capacity(prefix_pattern.len() + suffix_pattern.len());
+        combined.extend_from_slice(prefix_pattern);
+        combined.extend_from_slice(suffix_pattern);
+
         let pattern_buffer = device.new_buffer_with_data(
-            pattern.as_ptr() as *const _,
-            pattern.len() as u64,
+            combined.as_ptr() as *const _,
+            std::cmp::max(combined.len(), 1) as u64,
             metal::MTLResourceOptions::StorageModeShared,
         );
 
-        let pattern_len: u32 = pattern.len() as u32;
-        let pattern_len_buffer = device.new_buffer_with_data(
-            &pattern_len as *const _ as *const _,
+        let prefix_len: u32 = prefix_pattern.len() as u32;
+        let prefix_len_buffer = device.new_buffer_with_data(
+            &prefix_len as *const _ as *const _,
             4,
             metal::MTLResourceOptions::StorageModeShared,
         );
 
-        let is_suffix_u32: u32 = if is_suffix { 1 } else { 0 };
-        let is_suffix_buffer = device.new_buffer_with_data(
-            &is_suffix_u32 as *const _ as *const _,
+        let suffix_len: u32 = suffix_pattern.len() as u32;
+        let suffix_len_buffer = device.new_buffer_with_data(
+            &suffix_len as *const _ as *const _,
             4,
             metal::MTLResourceOptions::StorageModeShared,
         );
@@ -417,8 +431,8 @@ impl GpuNativeSearcher {
         encoder.set_buffer(0, Some(&points_buffer), 0);
         encoder.set_buffer(1, Some(&privkeys_buffer), 0);
         encoder.set_buffer(2, Some(&pattern_buffer), 0);
-        encoder.set_buffer(3, Some(&pattern_len_buffer), 0);
-        encoder.set_buffer(4, Some(&is_suffix_buffer), 0);
+        encoder.set_buffer(3, Some(&prefix_len_buffer), 0);
+        encoder.set_buffer(4, Some(&suffix_len_buffer), 0);
         encoder.set_buffer(5, Some(&found_buffer), 0);
         encoder.set_buffer(6, Some(&result_thread_buffer), 0);
         encoder.set_buffer(7, Some(&result_offset_buffer), 0);
@@ -455,19 +469,23 @@ impl GpuNativeSearcher {
 }
 
 /// Recover private key from GPU search result
-/// If offset has bit 31 set, it's a GLV endomorphism result:
-/// the actual private key is λ * (base_key + real_offset) mod n
+/// The top 3 bits of offset encode the endomorphism variant (0-5):
+///   0: original point (x, y)           -> key = k
+///   1: GLV β point (β·x, y)            -> key = λ·k mod n
+///   2: GLV β² point (β²·x, y)          -> key = λ²·k mod n
+///   3: negated point (x, -y)            -> key = n - k
+///   4: GLV β + negation (β·x, -y)       -> key = n - (λ·k mod n)
+///   5: GLV β² + negation (β²·x, -y)     -> key = n - (λ²·k mod n)
+/// The bottom 29 bits encode the step offset within the thread.
 pub fn recover_private_key(
     base_key: &SecretKey,
     thread_id: u32,
     offset: u32,
     steps_per_thread: u64,
 ) -> Result<SecretKey, String> {
-    // Check GLV flag (bit 31 of offset)
-    let is_glv = (offset & 0x80000000) != 0;
-    let real_offset = offset & 0x7FFFFFFF;
-
-    let _secp = Secp256k1::new();
+    // Decode variant from top 3 bits, real offset from bottom 29 bits
+    let variant = (offset >> 29) as u8;
+    let real_offset = offset & 0x1FFFFFFF;
 
     // Calculate total offset: thread_id * steps_per_thread + real_offset
     let thread_offset = (thread_id as u64)
@@ -490,12 +508,46 @@ pub fn recover_private_key(
     let mut key = base_key.add_tweak(&offset_scalar)
         .map_err(|e| format!("Key addition failed: {}", e))?;
 
-    // If GLV match, multiply by lambda: k' = λ * k mod n
-    if is_glv {
-        let lambda_scalar = Scalar::from_be_bytes(GLV_LAMBDA)
-            .map_err(|_| "Invalid lambda scalar")?;
-        key = key.mul_tweak(&lambda_scalar)
-            .map_err(|e| format!("GLV multiplication failed: {}", e))?;
+    // Apply variant transformation
+    match variant {
+        0 => {
+            // Original point - key as-is
+        }
+        1 => {
+            // GLV β: multiply by λ
+            let lambda_scalar = Scalar::from_be_bytes(GLV_LAMBDA)
+                .map_err(|_| "Invalid lambda scalar")?;
+            key = key.mul_tweak(&lambda_scalar)
+                .map_err(|e| format!("GLV lambda multiplication failed: {}", e))?;
+        }
+        2 => {
+            // GLV β²: multiply by λ²
+            let lambda_sq_scalar = Scalar::from_be_bytes(GLV_LAMBDA_SQ)
+                .map_err(|_| "Invalid lambda_sq scalar")?;
+            key = key.mul_tweak(&lambda_sq_scalar)
+                .map_err(|e| format!("GLV lambda_sq multiplication failed: {}", e))?;
+        }
+        3 => {
+            // Negation: n - k
+            key = key.negate();
+        }
+        4 => {
+            // GLV β + negation: negate(λ·k)
+            let lambda_scalar = Scalar::from_be_bytes(GLV_LAMBDA)
+                .map_err(|_| "Invalid lambda scalar")?;
+            key = key.mul_tweak(&lambda_scalar)
+                .map_err(|e| format!("GLV lambda multiplication failed: {}", e))?;
+            key = key.negate();
+        }
+        5 => {
+            // GLV β² + negation: negate(λ²·k)
+            let lambda_sq_scalar = Scalar::from_be_bytes(GLV_LAMBDA_SQ)
+                .map_err(|_| "Invalid lambda_sq scalar")?;
+            key = key.mul_tweak(&lambda_sq_scalar)
+                .map_err(|e| format!("GLV lambda_sq multiplication failed: {}", e))?;
+            key = key.negate();
+        }
+        _ => return Err(format!("Invalid endomorphism variant: {}", variant)),
     }
 
     Ok(key)

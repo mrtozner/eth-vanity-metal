@@ -31,7 +31,7 @@ fn main() {
     // Create a simple pattern for testing (doesn't matter for init benchmark)
     let pattern = vec![0xDE, 0xAD]; // "dead" prefix
 
-    let mut searcher = match ProfanityBatchSearcher::new(&ctx, &pattern, false) {
+    let mut searcher = match ProfanityBatchSearcher::new(&ctx, &pattern, &[]) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("Failed to create searcher: {:?}", e);

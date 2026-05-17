@@ -373,7 +373,12 @@ fn run_gpu_native_search(
     let mut found_count = 0u64;
     let mut batch_count = 0u64;
 
-    println!("Initializing GPU search...");
+    // Calculate difficulty for ETA estimation based on pattern nibble count
+    let prefix_nibbles = config.prefix.as_deref().map(|p| p.len()).unwrap_or(0);
+    let suffix_nibbles = config.suffix.as_deref().map(|s| s.len()).unwrap_or(0);
+    let total_nibbles = prefix_nibbles + suffix_nibbles;
+    let difficulty = 16.0_f64.powi(total_nibbles as i32);
+    println!("Difficulty: 1 in {} | Initializing GPU search...", format_number(difficulty as u64));
     std::io::stdout().flush().unwrap();
 
     while running.load(Ordering::SeqCst) {
@@ -434,14 +439,36 @@ fn run_gpu_native_search(
         let total_keys = batch_count * (num_threads as u64) * (steps_per_thread as u64) * 6;
         attempts.store(total_keys, Ordering::Relaxed);
 
-        // Update progress
+        // Update progress with ETA
         let elapsed = start_time.elapsed();
         let rate = total_keys as f64 / elapsed.as_secs_f64();
-        print!("\r[GPU-Native+6way] Found: {} | Scanned: {} | Speed: {:.2}M addr/s | Time: {}s   ",
+        let eta_str = if rate > 0.0 {
+            let remaining_expected = difficulty - total_keys as f64;
+            if remaining_expected > 0.0 {
+                let eta_secs = remaining_expected / rate;
+                if eta_secs > 86400.0 {
+                    format!("{:.1}d", eta_secs / 86400.0)
+                } else if eta_secs > 3600.0 {
+                    format!("{:.1}h", eta_secs / 3600.0)
+                } else if eta_secs > 60.0 {
+                    format!("{:.1}m", eta_secs / 60.0)
+                } else {
+                    format!("{:.0}s", eta_secs)
+                }
+            } else {
+                "any moment".to_string()
+            }
+        } else {
+            "calculating...".to_string()
+        };
+        let progress_pct = (total_keys as f64 / difficulty * 100.0).min(999.9);
+        print!("\r[GPU-Native+6way] Found: {} | Scanned: {} ({:.2}%) | Speed: {:.2}M/s | Elapsed: {}s | ETA: {}   ",
             found_count,
             format_number(total_keys),
+            progress_pct,
             rate / 1_000_000.0,
-            elapsed.as_secs()
+            elapsed.as_secs(),
+            eta_str
         );
         std::io::stdout().flush().unwrap();
     }
